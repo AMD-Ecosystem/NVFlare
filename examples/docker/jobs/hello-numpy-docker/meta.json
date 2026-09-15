@@ -1,0 +1,19 @@
+{
+    "name": "hello-numpy",
+    "min_clients": 2,
+    "deploy_map": {
+        "app": ["site-1", "server", "site-2"]
+    },
+    "launcher_spec": {
+        "server": {
+            "docker": {"image": "nvflare-job:latest"}
+        },
+        "site-1": {
+            "docker": {"image": "nvflare-job:latest"}
+        },
+        "site-2": {
+            "docker": {"image": "nvflare-job:latest"}
+        }
+    },
+    "resource_spec": {}
+}

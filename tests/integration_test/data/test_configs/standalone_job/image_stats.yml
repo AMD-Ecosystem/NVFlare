@@ -1,0 +1,38 @@
+additional_python_paths:
+- ../../examples/advanced/federated-statistics/image_stats
+cleanup: true
+jobs_root_dir: ./data/jobs
+project_yaml: data/projects/4_clients.yml
+tests:
+- event_sequence:
+  - actions:
+    - submit_job image_stats
+    result:
+      type: job_submit_success
+    trigger:
+      data: Server started
+      type: server_log
+  - actions:
+    - ensure_current_job_done
+    result:
+      data:
+        run_finished: true
+      type: run_state
+    trigger:
+      data:
+        run_finished: true
+      type: run_state
+  setup:
+  - cp ../../examples/advanced/federated-statistics/image_stats/requirements.txt ../../examples/advanced/federated-statistics/image_stats/temp_requirements.txt
+  - sed -i '/nvflare\|jupyter\|notebook/d' ../../examples/advanced/federated-statistics/image_stats/temp_requirements.txt
+  - pip install -r ../../examples/advanced/federated-statistics/image_stats/temp_requirements.txt
+  - python ../../examples/advanced/federated-statistics/image_stats/prepare_data.py --input_dir /tmp/nvflare/image_stats/data --output_dir /tmp/nvflare/image_stats/data
+  - rm -f ../../examples/advanced/federated-statistics/image_stats/temp_requirements.txt
+  test_name: Test example image_stats.
+  validators:
+  - path: tests.integration_test.src.validators.json_stats_result_validator.JsonStatsResultValidator
+    args:
+      relative_path: statistics/image_statistics.json
+      required_paths:
+      - intensity.count
+      - intensity.histogram

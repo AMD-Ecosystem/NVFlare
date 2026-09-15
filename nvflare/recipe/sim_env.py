@@ -1,0 +1,196 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import json
+import os
+import warnings
+from typing import Optional
+
+from pydantic import BaseModel, model_validator
+
+from nvflare.apis.fl_constant import WorkspaceConstants
+from nvflare.apis.job_def import RunStatus
+from nvflare.app_common.default_component_policy import DEFAULT_CLASS_ALLOW_LIST
+from nvflare.app_common.widgets.component_path_authorizer import CLASS_ALLOW_LIST
+from nvflare.job_config.api import FedJob
+
+from .spec import ExecEnv
+from .utils import collect_non_local_scripts
+
+WORKSPACE_ROOT = "/tmp/nvflare/simulation"
+SIMULATOR_WORKSPACE_ROOT_ENV_VAR = "NVFLARE_SIMULATOR_WORKSPACE_ROOT"
+
+
+# Internal — not part of the public API
+class _SimEnvValidator(BaseModel):
+    num_clients: int
+    clients: Optional[list[str]] = None
+    num_threads: Optional[int] = None
+    gpu_config: Optional[str] = None
+    log_config: Optional[str] = None
+    workspace_root: str = WORKSPACE_ROOT
+
+    @model_validator(mode="after")
+    def check_num_clients_consistency(self):
+        # Check if both num_clients and clients are not specified (invalid)
+        if self.num_clients == 0 and (self.clients is None or len(self.clients) == 0):
+            raise ValueError(
+                "Either 'num_clients' must be > 0 or 'clients' list must be provided. "
+                "Cannot run simulation with no clients."
+            )
+
+        # Check if both are specified and inconsistent
+        if self.num_clients > 0 and self.clients and len(self.clients) != self.num_clients:
+            raise ValueError(
+                f"Inconsistent number of clients: num_clients={self.num_clients} "
+                f"but clients list has {len(self.clients)} entries."
+            )
+        return self
+
+
+class SimEnv(ExecEnv):
+    def __init__(
+        self,
+        *,
+        num_clients: int = 0,
+        clients: Optional[list[str]] = None,
+        num_threads: Optional[int] = None,
+        gpu_config: Optional[str] = None,
+        log_config: Optional[str] = None,
+        workspace_root: str = WORKSPACE_ROOT,
+        extra: Optional[dict] = None,
+    ):
+        """Initialize simulation execution environment.
+
+        Args:
+            num_clients (int, optional): Number of simulated clients. Defaults to 0.
+            clients (list[str], optional): List of client names. Defaults to None.
+            num_threads (int, optional): Number of threads to run simulator. Defaults to None.
+                If not provided, the number of threads will be set to the number of clients.
+            gpu_config (str, optional): GPU configuration string. Defaults to None.
+            log_config (str, optional): Log configuration string. Defaults to None.
+            workspace_root (str, optional): Root directory for simulation workspace. Defaults to WORKSPACE_ROOT.
+                The process-level NVFLARE_SIMULATOR_WORKSPACE_ROOT orchestration setting takes precedence when set.
+            extra: extra env config info
+        """
+        super().__init__(extra)
+
+        v = _SimEnvValidator(
+            num_clients=num_clients,
+            clients=clients,
+            num_threads=num_threads,
+            gpu_config=gpu_config,
+            log_config=log_config,
+            workspace_root=workspace_root,
+        )
+
+        resolved_num_clients = v.num_clients if v.num_clients > 0 else len(v.clients or [])
+        self.num_clients = resolved_num_clients
+        self.num_threads = v.num_threads if v.num_threads is not None else resolved_num_clients
+        self.gpu_config = v.gpu_config
+        self.log_config = v.log_config
+        self.clients = v.clients
+        workspace_override = os.environ.get(SIMULATOR_WORKSPACE_ROOT_ENV_VAR)
+        if workspace_override and workspace_override != v.workspace_root:
+            warnings.warn(
+                f"{SIMULATOR_WORKSPACE_ROOT_ENV_VAR} overrides SimEnv workspace_root "
+                f"from {v.workspace_root!r} to {workspace_override!r}; unset it to use the constructor value",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        self.workspace_root = workspace_override or v.workspace_root
+        self.last_run_failed = False
+        self._job_statuses: dict[str, str] = {}
+
+    def deploy(self, job: FedJob):
+        job_id = job.name
+        self._job_statuses.pop(job_id, None)
+        self.last_run_failed = False
+
+        try:
+            # Validate scripts exist locally for simulation
+            non_local_scripts = collect_non_local_scripts(job)
+            if non_local_scripts:
+                raise ValueError(
+                    f"The following scripts do not exist locally: {non_local_scripts}. "
+                    f"For SimEnv, all scripts must be present on the local machine."
+                )
+
+            workspace = os.path.join(self.workspace_root, job_id)
+            self._ensure_default_component_policy(workspace)
+            run_status = job.simulator_run(
+                workspace=workspace,
+                n_clients=self.num_clients if self.clients is None else None,
+                clients=self.clients,
+                threads=self.num_threads,
+                gpu=self.gpu_config,
+                log_config=self.log_config,
+            )
+        except BaseException:
+            self._record_status(job_id, RunStatus.FAILED_TO_RUN)
+            raise
+        if run_status not in (None, 0):
+            status = RunStatus.FINISHED_ABNORMAL if run_status == -9 else RunStatus.FINISHED_EXECUTION_EXCEPTION
+            self._record_status(job_id, status)
+            raise RuntimeError(
+                f"Simulation failed with return code {run_status}. "
+                f"Logs are in per-site subdirectories under {os.path.join(self.workspace_root, job_id)}, "
+                f"e.g. server/simulate_job/log.txt"
+            )
+        self._record_status(job_id, RunStatus.FINISHED_COMPLETED)
+        return job_id
+
+    def _record_status(self, job_id: str, status: RunStatus) -> None:
+        self.last_run_failed = status != RunStatus.FINISHED_COMPLETED
+        self._job_statuses[job_id] = status.value
+
+    @staticmethod
+    def _ensure_default_component_policy(workspace: str) -> None:
+        """Install the standard policy unless the simulation workspace already defines one."""
+        local_dir = os.path.join(workspace, WorkspaceConstants.SITE_FOLDER_NAME)
+        resources_file = os.path.join(local_dir, WorkspaceConstants.RESOURCES_CONFIG)
+        default_resources_file = os.path.join(local_dir, WorkspaceConstants.DEFAULT_RESOURCES_CONFIG)
+
+        target_file = resources_file if os.path.exists(resources_file) else default_resources_file
+        resources = {"format_version": 2}
+        if os.path.exists(target_file):
+            with open(target_file) as f:
+                resources = json.load(f)
+            if not isinstance(resources, dict):
+                raise ValueError(f"Simulator resources file must contain a JSON object: {target_file}")
+
+        if CLASS_ALLOW_LIST in resources:
+            return
+
+        resources[CLASS_ALLOW_LIST] = list(DEFAULT_CLASS_ALLOW_LIST)
+        os.makedirs(local_dir, exist_ok=True)
+        with open(target_file, "w") as f:
+            json.dump(resources, f, indent=4)
+
+    def get_job_status(self, job_id: str) -> Optional[str]:
+        """Get the final status of a synchronous simulation, if known."""
+        return self._job_statuses.get(job_id)
+
+    def abort_job(self, job_id: str) -> None:
+        """Abort job - not supported in simulation environment."""
+        print("abort is not supported in a simulation environment, it will always run to completion.")
+
+    def get_job_result(self, job_id: str, timeout: float = 0.0) -> Optional[str]:
+        """Get job result workspace path."""
+        if self.workspace_root is None:
+            raise RuntimeError("Simulation workspace_root is None - SimEnv may not be properly initialized")
+        if self.get_job_status(job_id) != RunStatus.FINISHED_COMPLETED.value:
+            return None
+        result_path = os.path.join(self.workspace_root, job_id)
+        return result_path if os.path.exists(result_path) else None

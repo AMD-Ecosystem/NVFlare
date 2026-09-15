@@ -1,0 +1,446 @@
+
+.. _job_recipe:
+
+Getting Started with Recipes
+============================
+
+This task-oriented tutorial shows how to create and run an NVFlare job with a
+concrete Recipe. Recipes hide low-level job configuration while exposing the
+arguments needed for common federated learning workflows.
+
+Use this page for motivation and runnable walkthroughs. The authoritative
+signatures, helper behavior, ordering requirements, and guarantees are in the
+:ref:`recipe_api`. The lower-level :ref:`fed_job_api` remains a separate path
+for advanced workflows that require arbitrary component placement or custom
+job construction.
+
+
+Why Use Recipes
+---------------
+
+The **Job API** provides a powerful and flexible way to define FLARE FL workflows and configurations in Python without manually editing configuration files. While the API simplified the process compared to previous approaches, it is not simple enough. For new users and data scientists working with standard pipelines, learning detailed concepts such as controllers, executors, workflows, and how to wire them together is unnecessary.
+
+To address this, NVFlare provides concrete **Recipes** as a simplified,
+high-level API with:
+
+* **Only the key arguments** a data scientist should care about, such as the number of clients, number of rounds, training scripts, and model definition.
+* **Consistent entry points** for common federated learning patterns such as **FedAvg** and **Cyclic Training**.
+* **Execution environments** from simulation to production for the same job.
+
+This makes Recipes particularly useful as a **first touchpoint** for new users
+and data scientists working with standard pipelines:
+
+* Instead of learning the entire Job API, users can start with a recipe and focus only on high-level parameters (e.g., ``min_clients``, ``num_rounds``).
+* Recipes encapsulate the necessary job structure and execution logic, ensuring correctness while reducing the chance of misconfiguration.
+* If necessary, users can later progress to customizing the full Job API once they are comfortable with the basics.
+
+Model Input Options
+-------------------
+
+Recipes accept model input in two formats, each with different trade-offs:
+
+**Option 1: Class Instance (Recommended for simplicity)**
+
+.. code-block:: python
+
+   from nvflare.app_opt.pt.recipes import FedAvgRecipe
+   from model import SimpleNetwork
+
+   recipe = FedAvgRecipe(
+       name="hello-pt",
+       model=SimpleNetwork(),  # Instantiated model
+       train_script="client.py",
+       ...
+   )
+
+**Option 2: Dictionary Configuration (Recommended for large models)**
+
+.. code-block:: python
+
+   recipe = FedAvgRecipe(
+       name="hello-pt",
+       model={
+           "class_path": "model.SimpleNetwork",
+           "args": {"num_classes": 10, "hidden_dim": 256}
+       },
+       train_script="client.py",
+       ...
+   )
+
+.. important::
+
+   **Understanding Model Serialization**
+
+   When you pass a class instance (e.g., ``SimpleNetwork()``), NVFlare does **not** ship the Python object directly.
+   Instead, the model is converted to a configuration file before job submission. The actual model is re-instantiated
+   on the server/clients from this configuration.
+
+   This means:
+
+   * **Large models**: Instantiating a large model (e.g., LLM with billions of parameters) just to create a recipe
+     is inefficient. Use the dictionary format to avoid unnecessary instantiation time and memory usage.
+   * **Non-serializable state**: If your model carries state that cannot be reconstructed from JSON configuration
+     (e.g., loaded data, open file handles), that state will be lost.
+   * **TensorFlow/Keras class instances**: Use a user-defined subclass (for example, subclassing
+     ``tf.keras.Model`` or ``tf.keras.Sequential``) so the model can be reconstructed from class path and args.
+     Passing raw inline Keras model objects may fail during job export.
+   * **Trade-off**: Class instance is more Pythonic and catches errors early; dictionary format is more performant
+     for large models.
+
+Pre-trained Checkpoint Path
+---------------------------
+
+Use ``initial_ckpt`` to specify a path to pre-trained model weights:
+
+.. code-block:: python
+
+   recipe = FedAvgRecipe(
+       name="hello-pt",
+       model=SimpleNetwork(),
+       initial_ckpt="/data/models/pretrained_model.pt",  # Absolute path
+       train_script="client.py",
+       ...
+   )
+
+.. important::
+
+   **Checkpoint Path Requirements**
+
+   * **Absolute path required**: The path must be an absolute path (e.g., ``/data/models/model.pt``), not relative.
+   * **May not exist locally**: The checkpoint file does **not** need to exist on the machine where you create
+     the recipe. It only needs to exist on the **server** when the model is actually loaded during job execution.
+   * **PyTorch requires model architecture**: For PyTorch, you must provide ``model`` (class instance or
+     dict config) along with ``initial_ckpt``, because PyTorch checkpoints contain only weights, not architecture.
+   * **PyTorch update schema**: The server-side PyTorch model or checkpoint defines the accepted
+     ``state_dict()`` key schema for client updates. A client may return only the subset of keys it trained,
+     but every returned key must already exist in the server schema. New client-only keys are rejected.
+   * **TensorFlow/Keras can use checkpoint alone**: Keras ``.h5`` or SavedModel formats contain both architecture
+     and weights, so ``initial_ckpt`` can be used without ``model``. If ``model`` is provided, use a subclassed
+     Keras class instance (or dict config).
+
+**Example: Resume training from pre-trained weights**
+
+.. code-block:: python
+
+   # PyTorch: requires both model and checkpoint
+   recipe = FedAvgRecipe(
+       model=SimpleNetwork(),
+       initial_ckpt="/server/path/to/pretrained.pt",
+       ...
+   )
+
+   # TensorFlow: checkpoint alone works (Keras saves full model)
+   recipe = FedAvgRecipe(
+       initial_ckpt="/server/path/to/pretrained.h5",
+       framework=FrameworkType.TENSORFLOW,
+       ...
+   )
+
+Basic Example
+-------------
+
+Let's start with a simple example using the ``FedAvgRecipe`` for PyTorch. This recipe automatically handles all the complexity of setting up a federated averaging workflow.
+
+We use our existing training network under ``../hello-world/hello-pt/model.py`` and script ``client.py`` to generate the recipe:
+
+.. code-block:: python
+
+   import os
+   import sys
+   sys.path.append("../hello-world/hello-pt")
+
+   from nvflare.app_opt.pt.recipes.fedavg import FedAvgRecipe
+   from model import SimpleNetwork
+
+   # Create a FedAvg recipe
+   recipe = FedAvgRecipe(
+       name="hello-pt",
+       min_clients=2,
+       num_rounds=3,
+       model=SimpleNetwork(),
+       train_script="client.py",
+       train_args="--batch_size 32",
+   )
+
+   print("Recipe created successfully!")
+   print(f"Recipe name: {recipe.name}")
+   print(f"Min clients: {recipe.min_clients}")
+   print(f"Number of rounds: {recipe.num_rounds}")
+
+Metrics Artifacts
+-----------------
+
+Training aggregation recipes write standard metrics artifacts when their server
+workflow reports round-level aggregation metrics. See
+:ref:`recipe_metrics_artifacts` for the schema, security behavior, and how
+tools locate the artifacts.
+
+Per-Site Configuration
+----------------------
+
+Some recipes accept site-keyed configuration so that each site can use different
+arguments, scripts, or data loaders. Call ``set_per_site_config`` immediately
+after constructing the recipe, before adding client configuration, files,
+filters, or tracking:
+
+.. code-block:: python
+
+   from nvflare.recipe import SimEnv, set_per_site_config
+
+   set_per_site_config(
+       recipe,
+       {
+           "site-1": {"train_args": "--data_path xxx --batch_size 4"},
+           "site-2": {"train_args": "--data_path yyy --batch_size 2"},
+       },
+   )
+
+   env = SimEnv(clients=recipe.configured_sites())
+
+See :ref:`recipe_per_site_and_metadata` for supported recipes and fields,
+ordering and topology rules, validation, and ``configured_sites()`` behavior.
+
+No Secrets In Recipe Parameters
+-------------------------------
+
+Recipe inputs can be serialized in clear text into the generated job. Never
+put passwords, API keys, tokens, private keys, or other credentials in them.
+See :ref:`recipe_secrets` for supported references, runtime boundaries,
+warnings, and deployment guidance.
+
+Recipe Metadata
+---------------
+
+Use ``set_recipe_meta`` to add generated job metadata from a recipe without
+mutating nested generated-job metadata directly. The helper sets one ``JobMetaKey``
+metadata entry at a time:
+
+.. code-block:: python
+
+   from nvflare.apis.job_def import JobMetaKey
+   from nvflare.recipe import set_recipe_meta
+
+   set_recipe_meta(
+       recipe,
+       JobMetaKey.SCOPE,
+       "private",
+   )
+   set_recipe_meta(
+       recipe,
+       JobMetaKey.RESOURCE_SPEC,
+       {
+           "site-1": {"num_of_gpus": 1, "mem_per_gpu_in_GiB": 4},
+           "site-2": {"num_of_gpus": 1, "mem_per_gpu_in_GiB": 2},
+       },
+   )
+   set_recipe_meta(
+       recipe,
+       JobMetaKey.JOB_LAUNCHER_SPEC,
+       {
+           "site-1": {"docker": {"image": "nvflare-site1:latest"}},
+           "site-2": {"docker": {"image": "nvflare-site2:latest"}},
+       },
+   )
+
+See :ref:`recipe_per_site_and_metadata` for accepted keys and value shapes,
+serialization rules, precedence, and validation guarantees.
+
+For a complete production example, see the
+:github_nvflare_link:`Recipe job on Kubernetes clients <examples/advanced/recipe-k8s>`.
+It uses ``ProdEnv`` to submit a PyTorch CIFAR-10 job to ``site-1`` and
+``site-2`` in separate Kubernetes clusters, keeps GPU requirements in
+``resource_spec``, and places the per-cluster job images and container
+settings in ``launcher_spec``.
+
+Execution Environments
+----------------------
+
+A **Job Recipe** defines *what* to run in a federated learning setting, but it also needs to know *where* to run. NVFlare provides several **execution environments** that allow the same recipe to be executed in different contexts:
+
+* **Simulation (** ``SimEnv`` **)** – For local testing and experimentation on a single machine or in one batch job
+* **Proof-of-Concept (** ``PocEnv`` **)** – For small-scale, multi-process setups that mimic real-world deployment on a single machine
+* **Production (** ``ProdEnv`` **)** – For full-scale distributed deployments across multiple organizations and sites
+
+This separation enables users to **prototype once and deploy anywhere** without modifying the core job definition.
+
+For the current environment constructor signatures and behavioral guarantees,
+see :ref:`recipe_execution_environments`.
+
+SimEnv – Simulation Environment
+-------------------------------
+
+Runs the job with the local FL simulator backend: no provisioned project or
+long-running server/client daemons. Simulated clients use local worker
+processes; ``num_threads`` is the historical name for the worker-process
+concurrency. Best suited for:
+
+* Quick experiments
+* Debugging scripts and models
+* Educational use cases
+* Batch-scheduled experiments where one submitted job should run the complete
+  federated workflow and then exit
+
+Now let's test running the prepared recipe with ``SimEnv``:
+
+.. code-block:: python
+
+   from nvflare.recipe.sim_env import SimEnv
+   # Create a simulation environment
+   env = SimEnv(
+       num_clients=2, 
+       num_threads=2,
+   )
+   # Execute the recipe
+   run = recipe.execute(env=env)
+   run.get_status()
+   run.get_result()
+
+The result is stored under ``/tmp/nvflare/simulation/hello-pt``.
+
+PocEnv – Proof-of-Concept Environment
+-------------------------------------
+
+Runs server and clients as **separate processes** on the same machine. This simulates real-world deployment within a single node, with server and clients running in different processes. More realistic than ``SimEnv``, but still lightweight enough for a single node.
+
+Best suited for:
+
+* Demonstrations
+* Small-scale validation before production deployment
+* Debugging orchestration logic
+
+Let's first set the path to the POC environment:
+
+.. code-block:: shell
+
+   %env NVFLARE_POC_WORKSPACE=/tmp/nvflare/poc
+
+.. code-block:: python
+
+   from nvflare.recipe.poc_env import PocEnv
+
+   # Create a POC environment
+   env = PocEnv(
+       num_clients=2
+   )
+   # Execute the recipe
+   run = recipe.execute(env=env)
+   run.get_status()
+   run.get_result()
+
+``PocEnv`` creates a unique Recipe-owned workspace beside the configured path,
+such as ``/tmp/nvflare/poc.recipe-<unique-id>``. The reusable ``nvflare poc``
+CLI workspace at ``/tmp/nvflare/poc`` is not replaced by Recipe provisioning.
+The active path is available as ``env.poc_workspace``. Pass ``clean_up=False``
+to ``run.get_result()`` when you want to retain that workspace and its logs
+after the run. Each ``PocEnv`` instance owns one provisioning lifecycle; create
+a new instance for another deployment after provisioning has begun. Recipe POC
+deployments still compete for their configured server ports, although custom
+projects with distinct ports can run concurrently. Docker Recipe deployments
+use unique per-workspace container and network names. Also run ``nvflare poc
+stop`` before starting ``PocEnv`` when the configured CLI deployment is active.
+See :ref:`recipe_execution_environments` for lifecycle, conflict-checking, and
+failure-cleanup details.
+
+To use a named study, point ``PocEnv`` to a custom project file that defines ``studies:``:
+
+.. code-block:: python
+
+   env = PocEnv(
+       num_clients=2,
+       project_conf_path="/tmp/nvflare/poc_project.yml",
+       study="cancer-research"  # omit for the default study
+   )
+
+If ``project_conf_path`` is not specified, or if the project does not define ``studies:``, the POC deployment behaves as single-tenant and only the ``default`` study is valid.
+
+ProdEnv – Production Environment
+--------------------------------
+
+We assume a system with a server and clients is up and running across **multiple machines and sites**. This environment uses secure communication channels and real-world NVFlare deployment infrastructure. ``ProdEnv`` utilizes the admin's startup package to communicate with an existing NVFlare system to execute and monitor job execution.
+
+Best suited for:
+
+* Enterprise federated learning deployments
+* Multi-institution collaborations
+* Production-scale workloads
+
+Let's first provision a startup kit:
+
+.. code-block:: shell
+
+   !nvflare provision -p project.yml -w /tmp/nvflare/prod_workspaces
+
+Let's then start all parties (from terminal, rather than running the below script directly within notebook):
+
+.. code-block:: shell
+
+   bash /tmp/nvflare/prod_workspaces/example_project/prod_00/start_all.sh
+
+Now let's go ahead with environment creation and recipe execution.
+
+.. code-block:: python
+
+   from nvflare.recipe.prod_env import ProdEnv
+   import os
+   import sys
+   sys.path.append("../hello-world/hello-pt")
+
+   from nvflare.app_opt.pt.recipes.fedavg import FedAvgRecipe
+   from model import SimpleNetwork
+
+   # Create a FedAvg recipe
+   recipe = FedAvgRecipe(
+       name="hello-pt",
+       min_clients=2,
+       num_rounds=3,
+       model=SimpleNetwork(),
+       train_script="client.py",
+       train_args="--batch_size 32",
+   )
+   # Create a Prod environment
+   env = ProdEnv(
+       startup_kit_location="/tmp/nvflare/prod_workspaces/example_project/prod_00/admin@nvidia.com",
+       study="cancer-research"  # omit for the default study
+   )
+   # Execute the recipe
+   run = recipe.execute(env=env)
+   run.get_status()
+   run.get_result()
+
+Benefits of Environment Abstraction
+-----------------------------------
+
+* **Consistency** – A recipe defined once can be reused across all environments without modification.
+* **Progressive workflow** – Start in ``SimEnv`` for prototyping, move to ``PocEnv`` for validation, and finally deploy with ``ProdEnv``.
+* **Scalability** – The same training logic scales from a laptop experiment to a global production deployment.
+
+Special Considerations for Edge Applications
+---------------------------------------------
+
+Edge applications running with the new hierarchical system are not supported by the simulator and at the current version must run with ``ProdEnv``. Please see more detailed examples `here <https://github.com/NVIDIA/NVFlare/tree/main/examples/advanced/edge>`_. In particular, see the edge recipe preparation and experimental run in `this example <https://github.com/NVIDIA/NVFlare/blob/main/examples/advanced/edge/jobs/pt_job_adv.py>`_.
+
+Best Practices
+--------------
+
+1. **Develop in** ``SimEnv`` to iterate quickly.
+2. **Validate in** ``PocEnv`` to test multi-process orchestration.
+3. **Deploy in** ``ProdEnv`` for real-world federated learning.
+4. **Start simple** with basic recipes before customizing.
+5. **Use consistent naming** for your recipes and experiments.
+6. **Monitor execution** to understand the federated learning process.
+
+Summary
+-------
+
+Job Recipes, combined with execution environments, provide a **unified abstraction** for defining and running federated learning jobs:
+
+* **Recipes define how training should proceed** (e.g., FedAvg, FedOpt, Swarm Learning)
+* **Environments define where and how the job runs** (simulation, proof-of-concept, production)
+
+This separation ensures that the same recipe can seamlessly transition from **local testing** to **enterprise-scale production** without requiring code changes.
+
+The goal of Job Recipes is to create a simple entry point into NVFlare that is most intuitive for new users and data scientists running standard FL pipelines, while still allowing for growth into more complex and customizable workflows.
+
+Examples
+--------
+To see more examples of Job Recipe in action, check out the quick start series :ref:`quickstart`, where several job recipes are demonstrated.

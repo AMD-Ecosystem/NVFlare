@@ -1,0 +1,651 @@
+# Copyright (c) 2021-2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import copy
+import importlib
+import json
+import logging
+import os
+import pkgutil
+import subprocess
+import sys
+import warnings
+from typing import List, Optional, Union
+
+from nvflare.apis.app_validation import AppValidationKey, AppValidator
+from nvflare.apis.client import Client
+from nvflare.apis.event_type import EventType
+from nvflare.apis.fl_component import FLContext
+from nvflare.apis.fl_constant import ConfigVarName, FLContextKey, FLMetaKey, JobConstants, SiteType, WorkspaceConstants
+from nvflare.apis.fl_exception import UnsafeComponentError
+from nvflare.apis.job_def import JobMetaKey
+from nvflare.apis.job_launcher_spec import JobLauncherSpec
+from nvflare.apis.utils.decomposers import flare_decomposers
+from nvflare.apis.workspace import Workspace
+from nvflare.app_common.decomposers import common_decomposers
+from nvflare.app_common.widgets.component_path_authorizer import ComponentPathAuthorizer
+from nvflare.fuel.common.exit_codes import ProcessExitCode
+from nvflare.fuel.f3.stats_pool import CsvRecordHandler, StatsPoolManager
+from nvflare.fuel.sec.audit import AuditService
+from nvflare.fuel.sec.authz import AuthorizationService
+from nvflare.fuel.sec.security_content_service import LoadResult, SecurityContentService
+from nvflare.fuel.utils import fobs
+from nvflare.fuel.utils.fobs.fobs import register_custom_folder
+from nvflare.private.defs import RequestHeader, SSLConstants
+from nvflare.private.event import fire_event
+from nvflare.private.fed.utils.decomposers import private_decomposers
+from nvflare.private.privacy_manager import PrivacyManager, PrivacyService
+from nvflare.security.logging import secure_format_exception
+from nvflare.security.security import EmptyAuthorizer, FLAuthorizer
+from nvflare.security.study_registry import StudyRegistry, StudyRegistryService
+
+from ..simulator.simulator_const import SimulatorConstants
+from .app_authz import AppAuthzService
+
+# Job signing uses the same trust model for centralized and distributed provisioning:
+# the submitted job carries the submitter certificate, and verification chains that cert
+# to the site's rootCA.pem.  require_signed_jobs() only controls whether unsigned job
+# folders are accepted.  _warn_once suppresses repeated log noise for the same condition.
+_SIGNED_JOB_WARNINGS_EMITTED = set()
+_DEFAULT_COMPONENT_PATH_AUTHORIZER = ComponentPathAuthorizer()
+_AUTHORIZATION_JOB_META_CACHE = "__authorization_job_meta_cache__"
+_JOB_META_CACHE_MISSING = object()
+
+
+def _warn_once(logger: logging.Logger, cache_key: str, message: str, *args) -> None:
+    # Suppress duplicate warnings emitted on every job submission (e.g. TOCTOU advisory).
+    if cache_key in _SIGNED_JOB_WARNINGS_EMITTED:
+        return
+    _SIGNED_JOB_WARNINGS_EMITTED.add(cache_key)
+    logger.warning(message, *args)
+
+
+def require_signed_jobs(workspace: Workspace, startup_config: str = WorkspaceConstants.SERVER_STARTUP_CONFIG) -> bool:
+    """Return True if the site requires all submitted jobs to carry __nvfl_sig.json.
+
+    Centralized and distributed provisioning use the same verification model: the job
+    carries the submitter certificate, and that certificate must chain to the server's
+    or client's rootCA.pem. Operators can set ``require_signed_jobs: false`` in the
+    site's startup config to allow unsigned job folders without restarting the site
+    (hot-reload).
+
+    Default: True when rootCA.pem is present (any PKI deployment); False otherwise.
+    An explicit boolean "require_signed_jobs" overrides the inferred default.
+    """
+    import stat as _stat
+
+    logger = logging.getLogger(__name__)
+
+    startup_config_path = os.path.join(workspace.get_startup_kit_dir(), startup_config)
+    if os.path.exists(startup_config_path):
+        try:
+            _open_flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                _open_flags |= os.O_NOFOLLOW
+            fd = os.open(startup_config_path, _open_flags)
+            try:
+                with os.fdopen(fd) as f:
+                    fd = -1  # ownership transferred to f
+                    st = os.fstat(f.fileno())
+                    if st.st_mode & (_stat.S_IWGRP | _stat.S_IWOTH):
+                        _warn_once(
+                            logger,
+                            f"writable:{startup_config_path}",
+                            "%s is group/world-writable — require_signed_jobs policy "
+                            "can be altered by other local users (TOCTOU risk)",
+                            startup_config,
+                        )
+                    cfg = json.load(f)
+            except BaseException:
+                if fd != -1:
+                    os.close(fd)
+                raise
+            if "require_signed_jobs" in cfg:
+                value = cfg["require_signed_jobs"]
+                if not isinstance(value, bool):
+                    _warn_once(
+                        logger,
+                        f"invalid:{startup_config_path}",
+                        "invalid require_signed_jobs value in %s: expected a boolean — failing closed",
+                        startup_config,
+                    )
+                    return True
+                logger.debug("require_signed_jobs=%s (explicit config)", value)
+                return value
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            _warn_once(
+                logger,
+                f"parse:{startup_config_path}",
+                "failed to parse %s for require_signed_jobs: %s — failing closed",
+                startup_config,
+                e,
+            )
+            return True
+
+    root_ca_path = os.path.join(workspace.get_startup_kit_dir(), "rootCA.pem")
+    value = os.path.exists(root_ca_path)
+    logger.debug("require_signed_jobs=%s (inferred from rootCA.pem presence)", value)
+    return value
+
+
+def _check_secure_content(site_type: str) -> List[str]:
+    """To check the security contents.
+
+    Args:
+        site_type (str): "server" or "client"
+
+    Returns:
+        A list of insecure content.
+    """
+    if site_type == SiteType.SERVER:
+        config_file_name = WorkspaceConstants.SERVER_STARTUP_CONFIG
+    else:
+        config_file_name = WorkspaceConstants.CLIENT_STARTUP_CONFIG
+
+    insecure_list = []
+    data, sig = SecurityContentService.load_json(config_file_name)
+    if sig != LoadResult.OK:
+        insecure_list.append(config_file_name)
+
+    sites_to_check = data["servers"] if site_type == SiteType.SERVER else [data["client"]]
+
+    for site in sites_to_check:
+        for filename in [SSLConstants.CERT, SSLConstants.PRIVATE_KEY, SSLConstants.ROOT_CERT]:
+            content, sig = SecurityContentService.load_content(site.get(filename))
+            if sig != LoadResult.OK:
+                insecure_list.append(site.get(filename))
+
+    if WorkspaceConstants.AUTHORIZATION_CONFIG in SecurityContentService.security_content_manager.signature:
+        data, sig = SecurityContentService.load_json(WorkspaceConstants.AUTHORIZATION_CONFIG)
+        if sig != LoadResult.OK:
+            insecure_list.append(WorkspaceConstants.AUTHORIZATION_CONFIG)
+
+    # every resource file in the startup must be signed and not tampered with!
+    bad_files = SecurityContentService.check_json_files(
+        [
+            WorkspaceConstants.RESOURCE_FILE_NAME_PATTERN,
+            WorkspaceConstants.PARENT_RESOURCE_FILE_NAME_PATTERN,
+            WorkspaceConstants.JOB_RESOURCE_FILE_NAME_PATTERN,
+        ]
+    )
+
+    if bad_files:
+        insecure_list.extend(bad_files)
+
+    return insecure_list
+
+
+def security_init(secure_train: bool, site_org: str, workspace: Workspace, app_validator: AppValidator, site_type: str):
+    """To check the security content if running in security mode.
+
+    Args:
+       secure_train (bool): if run in secure mode or not.
+       site_org: organization of the site
+       workspace: the workspace object.
+       app_validator: app validator for application validation
+       site_type (str): server or client. fed_client.json or fed_server.json
+    """
+    # initialize the SecurityContentService.
+    # must do this before initializing other services since it may be needed by them!
+    startup_dir = workspace.get_startup_kit_dir()
+    SecurityContentService.initialize(content_folder=startup_dir)
+
+    # valid_config is False when the startup kit has no signature.json. That is expected
+    # for standard mTLS kits without a startup content-integrity manifest; TLS credentials
+    # remain the trust anchor.
+    if secure_train and SecurityContentService.security_content_manager.valid_config:
+        insecure_list = _check_secure_content(site_type=site_type)
+        if len(insecure_list):
+            print("The following files are not secure content.")
+            for item in insecure_list:
+                print(item)
+            sys.exit(1)
+
+    # initialize the AuditService, which is used by command processing.
+    # The Audit Service can be used in other places as well.
+    audit_file_name = workspace.get_audit_file_path()
+    AuditService.initialize(audit_file_name)
+
+    if app_validator:
+        AppAuthzService.initialize(app_validator)
+
+    # Initialize the AuthorizationService. It is used by command authorization
+    # We use FLAuthorizer for policy processing.
+    # AuthorizationService depends on SecurityContentService to read authorization policy file.
+    authorizer = None
+    if secure_train:
+        policy_file_path = workspace.get_authorization_file_path()
+
+        if policy_file_path and os.path.exists(policy_file_path):
+            with open(policy_file_path, "rt") as f:
+                policy_config = json.load(f)
+            authorizer = FLAuthorizer(site_org, policy_config)
+
+    if not authorizer:
+        authorizer = EmptyAuthorizer()
+
+    _, err = AuthorizationService.initialize(authorizer)
+
+    if err:
+        print("AuthorizationService error: {}".format(err))
+        sys.exit(1)
+
+    studies_file = workspace.get_study_registry_file_path()
+    registry = None
+    if os.path.exists(studies_file):
+        with open(studies_file, "rt") as f:
+            registry = StudyRegistry(json.load(f))
+    StudyRegistryService.initialize(registry)
+
+
+def security_init_for_job(secure_train: bool, workspace: Workspace, site_type: str, job_id: str):
+    """Initialize security processing for a job process (SJ or CJ).
+
+    Args:
+       secure_train (bool): if run in secure mode or not.
+       workspace: the workspace object.
+       site_type (str): server or client. fed_client.json or fed_server.json
+    """
+    # initialize the SecurityContentService.
+    # must do this before initializing other services since it may be needed by them!
+    startup_dir = workspace.get_startup_kit_dir()
+    SecurityContentService.initialize(content_folder=startup_dir)
+
+    # valid_config is False when the startup kit has no signature.json. That is expected
+    # for standard mTLS kits without a startup content-integrity manifest; TLS credentials
+    # remain the trust anchor.
+    if secure_train and SecurityContentService.security_content_manager.valid_config:
+        insecure_list = _check_secure_content(site_type=site_type)
+        if len(insecure_list):
+            print("The following files are not secure content.")
+            for item in insecure_list:
+                print(item)
+            sys.exit(1)
+
+    # initialize the AuditService, which is used by command processing.
+    # The Audit Service can be used in other places as well.
+    audit_file_name = workspace.get_audit_file_path(job_id)
+    AuditService.initialize(audit_file_name)
+
+
+def security_close():
+    AuditService.close()
+
+
+def get_job_meta_from_workspace(workspace: Workspace, job_id: str) -> dict:
+    job_meta_file_path = workspace.get_job_meta_path(job_id)
+    with open(job_meta_file_path) as file:
+        return json.load(file)
+
+
+def _get_job_meta_for_component_authorization(fl_ctx: FLContext, workspace: Workspace, job_id: str):
+    cached_meta = fl_ctx.get_prop(_AUTHORIZATION_JOB_META_CACHE, _JOB_META_CACHE_MISSING)
+    if cached_meta is not _JOB_META_CACHE_MISSING:
+        return copy.deepcopy(cached_meta)
+
+    meta = fl_ctx.get_prop(FLContextKey.JOB_META, _JOB_META_CACHE_MISSING)
+    if meta is _JOB_META_CACHE_MISSING:
+        meta = get_job_meta_from_workspace(workspace, job_id)
+
+    fl_ctx.set_prop(_AUTHORIZATION_JOB_META_CACHE, copy.deepcopy(meta), sticky=False, private=True)
+    return copy.deepcopy(meta)
+
+
+def create_job_processing_context_properties(workspace: Workspace, job_id: str) -> dict:
+    job_meta = get_job_meta_from_workspace(workspace, job_id)
+    if not isinstance(job_meta, dict):
+        raise RuntimeError(f"job_meta must be dict but got {type(job_meta)}")
+    scope_name = job_meta.get(JobMetaKey.SCOPE, "")
+    scope_object = PrivacyService.get_scope(scope_name)
+    scope_props = None
+    if scope_object:
+        scope_props = scope_object.props
+        effective_scope_name = scope_object.name
+    else:
+        effective_scope_name = ""
+
+    return {
+        FLContextKey.JOB_META: job_meta,
+        FLContextKey.JOB_SCOPE_NAME: scope_name,
+        FLContextKey.EFFECTIVE_JOB_SCOPE_NAME: effective_scope_name,
+        FLContextKey.SCOPE_PROPERTIES: scope_props,
+        FLContextKey.SCOPE_OBJECT: scope_object,
+    }
+
+
+def find_char_positions(s, ch):
+    return [i for i, c in enumerate(s) if c == ch]
+
+
+def get_scope_info():
+    try:
+        privacy_manager = PrivacyService.get_manager()
+        scope_names = []
+        default_scope_name = ""
+        if privacy_manager:
+            assert isinstance(privacy_manager, PrivacyManager)
+            if privacy_manager.name_to_scopes:
+                scope_names = sorted(privacy_manager.name_to_scopes.keys(), reverse=False)
+            if privacy_manager.default_scope:
+                default_scope_name = privacy_manager.default_scope.name
+        return scope_names, default_scope_name
+    except Exception:
+        return [], "processing_error"
+
+
+def fobs_initialize(workspace: Workspace = None, job_id: Optional[str] = None):
+    nvflare_fobs_initialize()
+
+    custom_fobs_initialize(workspace, job_id)
+
+
+def custom_fobs_initialize(workspace: Workspace = None, job_id: Optional[str] = None):
+    if workspace:
+        # site-level decomposers are installed by the site admin and always loaded
+        site_custom_dir = workspace.get_client_custom_dir()
+        decomposer_dir = os.path.join(site_custom_dir, ConfigVarName.DECOMPOSER_MODULE)
+        if os.path.exists(decomposer_dir):
+            register_custom_folder(decomposer_dir)
+
+        if job_id:
+            # decomposers shipped with the job are custom code: load them only from the job's
+            # custom dir (the BYOC-detected location) and only for BYOC-enabled jobs. Decomposers
+            # placed under the job config dir are intentionally ignored.
+            app_custom_dir = workspace.get_app_custom_dir(job_id)
+            decomposer_dir = os.path.join(app_custom_dir, ConfigVarName.DECOMPOSER_MODULE)
+            # confirm BYOC before probing the job-controlled path (no filesystem touch otherwise)
+            if _job_allows_byoc(workspace, job_id) and os.path.exists(decomposer_dir):
+                register_custom_folder(decomposer_dir)
+
+
+def _job_allows_byoc(workspace: Workspace, job_id: str) -> bool:
+    try:
+        job_meta = get_job_meta_from_workspace(workspace, job_id)
+        if not isinstance(job_meta, dict):
+            logging.getLogger(__name__).warning(
+                f"job meta for job '{job_id}' is not a dict (got {type(job_meta)}); treating as non-BYOC"
+            )
+            return False
+        return bool(job_meta.get(AppValidationKey.BYOC, False))
+    except Exception as e:
+        # fail safe: deny job decomposers, but log so a corrupted/misconfigured deployment
+        # can be told apart from a legitimate non-BYOC job
+        logging.getLogger(__name__).warning(
+            f"could not read job meta for job '{job_id}'; treating as non-BYOC: {secure_format_exception(e)}"
+        )
+        return False
+
+
+def nvflare_fobs_initialize():
+    flare_decomposers.register()
+    common_decomposers.register()
+    private_decomposers.register()
+
+
+def register_ext_decomposers(decomposer_module: Union[str, List[str]]):
+    if decomposer_module:
+        if isinstance(decomposer_module, str):
+            modules = [decomposer_module]
+        elif isinstance(decomposer_module, list):
+            modules = decomposer_module
+        else:
+            raise TypeError(f"decomposer_module must be str or list of strs but got {type(decomposer_module)}")
+
+        for module in modules:
+            register_decomposer_module(module)
+
+
+def register_decomposer_module(decomposer_module):
+    warnings.filterwarnings("ignore")
+    try:
+        package = importlib.import_module(decomposer_module)
+        for module_info in pkgutil.walk_packages(path=package.__path__, prefix=package.__name__ + "."):
+            if module_info.ispkg:
+                folder_name = module_info.module_finder.path
+                package_name = module_info.name
+                folder = os.path.join(folder_name, package_name.split(".")[-1])
+                fobs.register_folder(folder, package_name)
+    except (ModuleNotFoundError, RuntimeError, ValueError):
+        # logger.warning(f"Could not register decomposers from: {decomposer_module}")
+        pass
+
+
+def set_stats_pool_config_for_job(workspace: Workspace, job_id: str, prefix=None):
+    job_meta = get_job_meta_from_workspace(workspace, job_id)
+    config = job_meta.get(JobMetaKey.STATS_POOL_CONFIG)
+    if config:
+        StatsPoolManager.set_pool_config(config)
+        record_file = workspace.get_stats_pool_records_path(job_id, prefix)
+        record_writer = CsvRecordHandler(record_file)
+        StatsPoolManager.set_record_writer(record_writer)
+
+
+def create_stats_pool_files_for_job(workspace: Workspace, job_id: str, prefix=None):
+    err = ""
+    summary_file = workspace.get_stats_pool_summary_path(job_id, prefix)
+    try:
+        StatsPoolManager.dump_summary(summary_file)
+    except Exception as e:
+        err = f"Failed to create stats pool summary file {summary_file}: {secure_format_exception(e)}"
+    StatsPoolManager.close()
+    return err
+
+
+def split_gpus(gpus) -> [str]:
+    gpus = gpus.replace(" ", "")
+    lefts = find_char_positions(gpus, "[")
+    rights = find_char_positions(gpus, "]")
+    if len(lefts) != len(rights):
+        raise ValueError("brackets not paired")
+    for i in range(len(lefts)):
+        if i > 0 and lefts[i] < rights[i - 1]:
+            raise ValueError("brackets cannot be nested")
+
+    offset = 0
+    for i in range(len(lefts)):
+        l: int = lefts[i] - offset
+        r: int = rights[i] - offset
+        if l > r:
+            raise ValueError("brackets not properly paired")
+
+        if l > 0 and gpus[l - 1] != ",":
+            raise ValueError(f"invalid start of a group: {gpus[l - 1]}")
+        if r < len(gpus) - 1 and gpus[r + 1] != ",":
+            raise ValueError(f"invalid end of a group: {gpus[r + 1]}")
+        g = gpus[l : r + 1]  # include both left and right brackets
+        p = g[1:-1].replace(",", "^")
+        gpus = gpus.replace(g, p, 1)  # only replace the first occurrence!
+        offset += 2  # everything after the replacement is shifted to left by 2 (since the pair of brackets removed)
+
+    result = gpus.split(",")
+    result = [g.replace("^", ",") for g in result]
+    return result
+
+
+def authorize_build_component(config_dict, config_ctx, node, fl_ctx: FLContext, event_handlers) -> str:
+    workspace = fl_ctx.get_prop(FLContextKey.WORKSPACE_OBJECT)
+    if not workspace:
+        raise RuntimeError("missing workspace object in fl_ctx")
+    job_id = fl_ctx.get_prop(FLContextKey.CURRENT_JOB_ID)
+    if not job_id:
+        raise RuntimeError("missing job id in fl_ctx")
+    meta = _get_job_meta_for_component_authorization(fl_ctx, workspace, job_id)
+    fl_ctx.set_prop(FLContextKey.JOB_META, meta, sticky=False, private=True)
+    fl_ctx.set_prop(FLContextKey.COMPONENT_CONFIG, config_dict, sticky=False, private=True)
+    fl_ctx.set_prop(FLContextKey.CONFIG_CTX, config_ctx, sticky=False, private=True)
+    fl_ctx.set_prop(FLContextKey.COMPONENT_NODE, node, sticky=False, private=True)
+
+    try:
+        _DEFAULT_COMPONENT_PATH_AUTHORIZER.handle_event(EventType.BEFORE_BUILD_COMPONENT, fl_ctx)
+    except UnsafeComponentError as ex:
+        err = str(ex)
+        if not err:
+            err = "Unsafe component detected by built-in component path authorizer"
+        return err
+
+    fire_event(EventType.BEFORE_BUILD_COMPONENT, event_handlers or [], fl_ctx)
+
+    err = fl_ctx.get_prop(FLContextKey.COMPONENT_BUILD_ERROR)
+    if err:
+        return err
+    # check exceptions
+    exceptions = fl_ctx.get_prop(FLContextKey.EXCEPTIONS)
+    if exceptions and isinstance(exceptions, dict):
+        for handler_name, ex in exceptions.items():
+            if isinstance(ex, UnsafeComponentError):
+                err = str(ex)
+                if not err:
+                    err = f"Unsafe component detected by {handler_name}"
+                return err
+    return ""
+
+
+def set_message_security_data(request, job, fl_ctx):
+    request.set_header(RequestHeader.SUBMITTER_NAME, job.meta.get(JobMetaKey.SUBMITTER_NAME))
+    request.set_header(RequestHeader.SUBMITTER_ORG, job.meta.get(JobMetaKey.SUBMITTER_ORG))
+    request.set_header(RequestHeader.SUBMITTER_ROLE, job.meta.get(JobMetaKey.SUBMITTER_ROLE))
+
+    request.set_header(RequestHeader.USER_NAME, job.meta.get(JobMetaKey.SUBMITTER_NAME))
+    request.set_header(RequestHeader.USER_ORG, job.meta.get(JobMetaKey.SUBMITTER_ORG))
+    request.set_header(RequestHeader.USER_ROLE, job.meta.get(JobMetaKey.SUBMITTER_ROLE))
+
+    request.set_header(RequestHeader.JOB_META, job.meta)
+
+
+def get_target_names(targets):
+    # validate targets
+    target_names = []
+    for t in targets:
+        if isinstance(t, str):
+            name = t
+        elif isinstance(t, Client):
+            name = t.name
+        else:
+            raise ValueError(f"invalid target in list: got {type(t)}")
+
+        if not name:
+            # ignore empty name
+            continue
+
+        if name not in target_names:
+            target_names.append(name)
+    return target_names
+
+
+def get_return_code(job_handle, job_id, workspace, logger):
+    launcher_return_code = job_handle.poll()
+    return_code = launcher_return_code
+    run_dir = os.path.join(workspace, job_id)
+    rc_file = os.path.join(run_dir, FLMetaKey.PROCESS_RC_FILE)
+    if os.path.exists(rc_file):
+        try:
+            with open(rc_file, "r") as f:
+                return_code = int(f.readline())
+            os.remove(rc_file)
+        except Exception as e:
+            logger.warning(
+                f"Could not get the return code from {rc_file} of the job:{job_id}, "
+                f"falling back to the return code from the job_handle:{job_handle}: {secure_format_exception(e)}"
+            )
+    if launcher_return_code == ProcessExitCode.INFRASTRUCTURE_ERROR:
+        return launcher_return_code
+    return return_code
+
+
+def get_simulator_app_root(simulator_root, site_name):
+    return os.path.join(simulator_root, site_name, SimulatorConstants.JOB_NAME, "app_" + site_name)
+
+
+def extract_participants(participants_list):
+    """Extract participant site names from deploy_map forms.
+
+    Supported forms include:
+      - ["server", "site-1"]
+      - ["@ALL"]
+      - {"targets": ["server", "site-1"]}
+      - {"sites": ["server", "site-1"]}
+      - [{"sites": ["site-1"]}, "site-2"]
+      - [{"targets": ["site-1"]}, "site-2"]
+    """
+
+    targets_key = "targets"
+
+    if isinstance(participants_list, str):
+        participants_list = [participants_list]
+    elif isinstance(participants_list, dict):
+        if targets_key in participants_list:
+            participants_list = participants_list.get(targets_key)
+        elif JobConstants.SITES in participants_list:
+            participants_list = participants_list.get(JobConstants.SITES)
+        else:
+            raise ValueError(
+                f"invalid participant entry keys {list(participants_list.keys())}: expected '{targets_key}' or '{JobConstants.SITES}'"
+            )
+
+    if not isinstance(participants_list, list):
+        raise ValueError(f"participants must be list/str/dict, but got {type(participants_list)}")
+
+    participants = []
+    for item in participants_list:
+        if isinstance(item, str):
+            participants.append(item)
+        elif isinstance(item, dict):
+            sites = item.get(JobConstants.SITES)
+            if sites is None:
+                sites = item.get(targets_key)
+            if not isinstance(sites, list):
+                raise ValueError(
+                    f"site list must be list in participant entry {item}: expected '{targets_key}' or '{JobConstants.SITES}'"
+                )
+            participants.extend(sites)
+        else:
+            raise ValueError(f"Must be type of str or dict, but got {type(item)}")
+    return participants
+
+
+def get_job_launcher(job_meta: dict, fl_ctx: FLContext) -> JobLauncherSpec:
+    engine = fl_ctx.get_engine()
+
+    with engine.new_context() as job_launcher_ctx:
+        # Remove the potential not cleaned up JOB_LAUNCHER
+        job_launcher_ctx.remove_prop(FLContextKey.JOB_LAUNCHER)
+        job_launcher_ctx.set_prop(FLContextKey.JOB_META, job_meta, private=True, sticky=False)
+        engine.fire_event(EventType.BEFORE_JOB_LAUNCH, job_launcher_ctx)
+
+        job_launcher = job_launcher_ctx.get_prop(FLContextKey.JOB_LAUNCHER)
+        if not (job_launcher and isinstance(job_launcher, list)):
+            raise RuntimeError(f"There's no job launcher can handle this job: {job_meta}.")
+        if len(job_launcher) != 1:
+            launcher_types = [type(x).__name__ for x in job_launcher]
+            raise RuntimeError(
+                f"Exactly one job launcher must be configured for this site, but found {len(job_launcher)}: "
+                f"{launcher_types}."
+            )
+
+    launcher = job_launcher[0]
+    if not isinstance(launcher, JobLauncherSpec):
+        raise RuntimeError(f"The job launcher must be JobLauncherSpec but got {type(launcher)}")
+
+    return job_launcher[0]
+
+
+def execute_command_directly(args: List[str]) -> str:
+    """Execute a command directly, without using shell"""
+
+    result = subprocess.run(
+        args, capture_output=False, text=True, shell=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+    )
+
+    return result.stdout

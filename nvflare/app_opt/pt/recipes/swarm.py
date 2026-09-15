@@ -1,0 +1,452 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+import warnings
+from typing import Any, Dict, Literal, Optional, Union
+
+from pydantic import BaseModel, field_validator
+
+from nvflare.apis.dxo import DataKind
+from nvflare.app_common.aggregators.intime_accumulate_model_aggregator import InTimeAccumulateWeightedAggregator
+from nvflare.app_common.ccwf.ccwf_job import CCWFJob, CrossSiteEvalConfig, SwarmClientConfig, SwarmServerConfig
+from nvflare.app_common.ccwf.comps.simple_model_shareable_generator import SimpleModelShareableGenerator
+from nvflare.app_common.widgets.intime_model_selector import IntimeModelSelector
+from nvflare.app_opt.pt.file_model_persistor import PTFileModelPersistor
+from nvflare.client.config import ExchangeFormat, normalize_exchange_format
+from nvflare.fuel.utils.secret_utils import (
+    warn_on_potential_secrets,
+    warn_on_unsupported_secret_refs,
+    warn_on_unsupported_secret_refs_outside_keys,
+)
+from nvflare.fuel.utils.validation_utils import check_object_type, check_positive_int, check_positive_number
+from nvflare.job_config.script_runner import ScriptRunner
+from nvflare.recipe.spec import Recipe
+from nvflare.recipe.utils import merge_config_overrides, validate_aggregator_data_kind, validate_ckpt
+from nvflare.utils.argv_utils import normalize_argv
+
+_RECIPE_MANAGED_SERVER_CONFIG_KEYS = frozenset({"min_clients"})
+_RECIPE_MANAGED_CLIENT_CONFIG_KEYS = frozenset(
+    {"executor", "aggregator", "persistor", "shareable_generator", "model_selector", "min_responses_required"}
+)
+
+
+class _SwarmValidator(BaseModel):
+    initial_ckpt: Optional[str] = None
+    key_metric: Optional[str] = "accuracy"
+    key_metric_mode: Literal["min", "max"] = "max"
+
+    @field_validator("initial_ckpt")
+    @classmethod
+    def validate_initial_ckpt(cls, v):
+        if v is not None:
+            validate_ckpt(v)
+        return v
+
+    @field_validator("key_metric")
+    @classmethod
+    def validate_key_metric(cls, v):
+        if v is not None and not v.strip():
+            raise ValueError("key_metric must be a non-empty string or None")
+        return v
+
+    model_config = {"arbitrary_types_allowed": True}
+
+
+class BaseSwarmLearningRecipe(Recipe):
+    """Base recipe for Swarm Learning (framework-agnostic).
+
+    Server, client, and cross-site-evaluation config values become part of the generated
+    job definition and must never contain actual secrets. Read secrets from site environment
+    variables or mounted files; references are supported only where documented in
+    :mod:`nvflare.recipe.secrets`.
+
+    Args:
+        name: Name of the federated learning job.
+        server_config: Swarm server configuration.
+        client_config: Swarm client configuration.
+        cse_config: Optional cross-site evaluation configuration.
+        min_clients: Minimum number of clients required to schedule the job.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        server_config: SwarmServerConfig,
+        client_config: SwarmClientConfig,
+        cse_config: CrossSiteEvalConfig = None,
+        min_clients: int = 1,
+    ):
+        job = CCWFJob(name=name, min_clients=min_clients)
+        job.add_swarm(
+            server_config=server_config,
+            client_config=client_config,
+            cse_config=cse_config,
+        )
+        Recipe.__init__(self, job)
+
+
+class SwarmLearningRecipe(BaseSwarmLearningRecipe):
+    """A simple recipe for Swarm Learning with PyTorch models.
+
+    Args:
+        name: Name of the federated learning job.
+        model: PyTorch model to use as the initial model. Can be:
+            - An nn.Module instance (e.g., MyModel())
+            - A dict config: {"class_path": "module.ClassName", "args": {"param": value}}
+        num_rounds: Number of training rounds.
+        train_script: Path to the training script.
+        min_clients: Minimum number of clients required.
+        initial_ckpt: Path to a pre-trained checkpoint file (.pt, .pth). Can be:
+            - Relative path: file will be bundled into each client app's custom/ directory.
+            - Absolute path: used as-is at runtime. The file is not distributed and must
+              be readable at the same path on every client.
+        train_args: Additional arguments for the training script. The dictionary is stored
+            in the job definition and must not contain actual secret values; see
+            :mod:`nvflare.recipe.secrets` for safe runtime references.
+        do_cross_site_eval: Whether to perform cross-site evaluation. When combined with
+            ``launch_external_process=True``, the trained model is loaded from the
+            persistor on disk (saved by PTFileModelPersistor after each round).  Two
+            limitations apply in that combination:
+
+            1. **Custom persistors**: If your persistor streams models to a remote store
+               without supporting local ``get()``, the persistor path returns None and
+               CSE falls back to the executor, which also fails for ext-process mode.
+               Ensure your persistor's ``get()`` can retrieve the model locally.
+            2. **Cross-job evaluation**: CSE against a model trained in a *different* job
+               is not supported with ``launch_external_process=True`` because the current
+               job's persistor cannot locate the other job's workspace. Use in-process
+               mode or copy the trained model into the evaluating job's workspace.
+        cross_site_eval_timeout: Timeout for cross-site evaluation.
+        launch_external_process: Whether to launch the training script in an external process.
+            Defaults to False (in-process execution).
+        command: Command used to launch the script when launch_external_process=True, either as a
+            legacy string or pre-tokenized argv. Defaults to "python3 -u".
+        memory_gc_rounds: Run allocator-aware cleanup (gc.collect() + malloc_trim) on three
+            independent cadences: every N training rounds in the trainer, every N completed
+            learn tasks in each client job, and every N aggregations in the aggregation client
+            job. Defaults to 1. Set to 0 to disable allocator-aware cleanup. A plain gc.collect()
+            still runs after every client-job learn task regardless of this value.
+        cuda_empty_cache: Call torch.cuda.empty_cache() during cleanup. Defaults to False.
+        expected_data_kind: The data kind the aggregator expects from clients. Defaults to
+            DataKind.WEIGHTS for full-weight FedAvg. Clients returning differences must label
+            their result with FLModel.params_type=ParamsType.DIFF.
+        params_transfer_type: How parameters are transferred between client script and NVFlare.
+            DIFF enables automatic difference calculation for full-model client results.
+            A client's FLModel.params_type remains authoritative. Defaults to FULL.
+        start_task_timeout: Seconds to wait for the starting client to acknowledge the start
+            task. Increase for large models that need time to load. Defaults to 300.
+        progress_timeout: Seconds of no progress from any client before the workflow is
+            considered stalled. Defaults to 3600.
+        max_status_report_interval: Maximum seconds between consecutive status reports from
+            a client before it is considered silent. Defaults to 300.
+        round_timeout: P2P model transfer ACK budget in seconds — how long the aggregator
+            waits for a receiver to acknowledge the model download via tensor streaming.
+            The "ACK" includes the full model download, so the hardcoded default of 10s
+            in SwarmClientConfig is too short for models larger than ~2GB.  Set higher
+            for large models (7B+) where P2P transfer can take minutes.  Does NOT cap
+            per-round training time (learn_task_timeout remains unbounded by default).
+            Defaults to 3600 (matching progress_timeout).
+        learn_task_timeout: Maximum seconds allowed for a learning task. ``None`` means
+            no limit. Defaults to None.
+        max_concurrent_submissions: Maximum number of concurrent result submissions
+            accepted by the aggregation client. Must be at least 1. Defaults to 1.
+        learn_task_abort_timeout: Seconds to wait for a learning task to stop after an
+            abort request. Must be positive when specified. ``None`` uses the Swarm
+            client controller default.
+        learn_task_ack_timeout: Seconds to wait for acknowledgment when dispatching a
+            learning task. ``None`` uses ``round_timeout`` for backward compatibility.
+        final_result_ack_timeout: Seconds to wait for clients to acknowledge the final
+            result. ``None`` uses ``round_timeout`` for backward compatibility.
+        server_config_overrides: Advanced shallow overrides for ``SwarmServerConfig``.
+            Values here take precedence over named constructor parameters, except
+            ``min_clients``, which must be set through the named parameter to keep
+            scheduler, server-controller, and client aggregation quorums aligned.
+            This dictionary is stored in the job definition and must not contain secrets.
+        client_config_overrides: Advanced shallow overrides for ``SwarmClientConfig``.
+            Values for non-recipe-managed fields take precedence over named constructor
+            parameters. Recipe-managed fields (executor, aggregator, persistor, shareable
+            generator, model selector, and ``min_responses_required``) cannot be replaced
+            through this dictionary. Use ``key_metric=None`` to disable model selection, or
+            ``BaseSwarmLearningRecipe`` with an explicit ``SwarmClientConfig`` for a custom
+            selector, other custom components, or quorum settings.
+            This dictionary is stored in the job definition and must not contain secrets.
+        aggregation_format: Parameter representation used by the CCWF controllers and aggregator.
+            Use ``ExchangeFormat.PYTORCH`` to keep tensors on the streaming path. Defaults to
+            ``ExchangeFormat.NUMPY`` for backward compatibility.
+        enable_tensor_disk_offload: Download incoming streamed PyTorch tensors to temporary disk
+            files on aggregation clients and materialize them lazily during aggregation. The
+            trainer's source tensors remain in memory. This requires
+            ``aggregation_format=ExchangeFormat.PYTORCH`` to take effect. Defaults to False.
+        key_metric: Metric used to determine the best global model. If validation metrics are
+            a dictionary, this selects the metric used by the client-side model selector.
+            Set to ``None`` to disable best-model selection. Defaults to "accuracy".
+        key_metric_mode: Whether lower ("min") or higher ("max") values of ``key_metric``
+            indicate a better model. Ignored when ``key_metric`` is ``None``. Defaults to "max".
+            In ``"min"`` mode, selector comparison values exposed through Swarm best-metric
+            logs and records are negated; for example, a loss of 2.31 is shown as -2.31.
+
+    Example:
+        Using nn.Module instance:
+
+        ```python
+        recipe = SwarmLearningRecipe(
+            name="swarm_job",
+            model=MyModel(),
+            min_clients=3,
+            num_rounds=5,
+            train_script="train.py",
+        )
+        ```
+
+        Using dict config:
+
+        ```python
+        recipe = SwarmLearningRecipe(
+            name="swarm_job",
+            model={"class_path": "my_module.MyModel", "args": {"num_classes": 10}},
+            min_clients=3,
+            num_rounds=5,
+            train_script="train.py",
+        )
+        ```
+    """
+
+    def __init__(
+        self,
+        name: str,
+        model: Union[Any, Dict[str, Any]],
+        num_rounds: int,
+        train_script: str,
+        min_clients: int,
+        initial_ckpt: Optional[str] = None,
+        train_args: dict = None,
+        do_cross_site_eval: bool = False,
+        cross_site_eval_timeout: float = 300,
+        launch_external_process: bool = False,
+        command: Union[str, list[str]] = "python3 -u",
+        memory_gc_rounds: int = 1,
+        cuda_empty_cache: bool = False,
+        expected_data_kind: str = DataKind.WEIGHTS,
+        params_transfer_type: str = "FULL",
+        start_task_timeout: float = 300,
+        progress_timeout: float = 3600,
+        max_status_report_interval: float = 300,
+        round_timeout: float = 3600,
+        learn_task_timeout: Optional[float] = None,
+        max_concurrent_submissions: int = 1,
+        learn_task_abort_timeout: Optional[float] = None,
+        learn_task_ack_timeout: Optional[float] = None,
+        final_result_ack_timeout: Optional[float] = None,
+        server_config_overrides: Optional[Dict[str, Any]] = None,
+        client_config_overrides: Optional[Dict[str, Any]] = None,
+        aggregation_format: ExchangeFormat = ExchangeFormat.NUMPY,
+        enable_tensor_disk_offload: bool = False,
+        key_metric: Optional[str] = "accuracy",
+        key_metric_mode: Literal["min", "max"] = "max",
+    ):
+        _SwarmValidator(
+            initial_ckpt=initial_ckpt,
+            key_metric=key_metric,
+            key_metric_mode=key_metric_mode,
+        )
+        command = normalize_argv(command, "command")
+        warn_on_potential_secrets(command, context="recipe parameter 'command'")
+        aggregation_format = normalize_exchange_format(aggregation_format, "aggregation_format")
+        self.aggregation_format = aggregation_format
+
+        if train_args:
+            warn_on_potential_secrets(train_args, context="recipe parameter 'train_args'")
+            warn_on_unsupported_secret_refs_outside_keys(
+                train_args,
+                supported_value_keys={"script_args"},
+                context="recipe parameter 'train_args'",
+            )
+        if server_config_overrides:
+            warn_on_potential_secrets(
+                server_config_overrides,
+                context="recipe parameter 'server_config_overrides'",
+            )
+            warn_on_unsupported_secret_refs(
+                server_config_overrides,
+                context="recipe parameter 'server_config_overrides'",
+            )
+        if client_config_overrides:
+            warn_on_potential_secrets(
+                client_config_overrides,
+                context="recipe parameter 'client_config_overrides'",
+            )
+            warn_on_unsupported_secret_refs(
+                client_config_overrides,
+                context="recipe parameter 'client_config_overrides'",
+            )
+
+        validated_server_config_overrides = merge_config_overrides(
+            {}, server_config_overrides, "server_config_overrides"
+        )
+        protected_server_overrides = _RECIPE_MANAGED_SERVER_CONFIG_KEYS.intersection(validated_server_config_overrides)
+        if protected_server_overrides:
+            fields = ", ".join(sorted(protected_server_overrides))
+            raise ValueError(
+                f"server_config_overrides cannot override recipe-managed fields: {fields}. "
+                "Set min_clients directly on SwarmLearningRecipe to keep all quorum settings aligned."
+            )
+
+        validated_client_config_overrides = merge_config_overrides(
+            {}, client_config_overrides, "client_config_overrides"
+        )
+        protected_overrides = _RECIPE_MANAGED_CLIENT_CONFIG_KEYS.intersection(validated_client_config_overrides)
+        if protected_overrides:
+            fields = ", ".join(sorted(protected_overrides))
+            raise ValueError(
+                f"client_config_overrides cannot override recipe-managed fields: {fields}. "
+                "Use named recipe parameters (key_metric=None disables model selection) or "
+                "BaseSwarmLearningRecipe with an explicit SwarmClientConfig for custom components."
+            )
+
+        validate_aggregator_data_kind(
+            data_kind=expected_data_kind,
+            recipe_name=type(self).__name__,
+            data_kind_arg="expected_data_kind",
+            require_data_kind=True,
+        )
+
+        # Handle dict-based model config (recipe accepts class_path; normalize for job API).
+        # Pass the dict directly to PTFileModelPersistor so args are preserved in the exported config.
+        # The persistor resolves the dict to an nn.Module at runtime via instantiate_class().
+        if isinstance(model, dict):
+            from nvflare.recipe.utils import recipe_model_to_job_model
+
+            model = recipe_model_to_job_model(model)
+
+        aggregator = InTimeAccumulateWeightedAggregator(expected_data_kind=expected_data_kind)
+        if do_cross_site_eval:
+            cse_config = CrossSiteEvalConfig(eval_task_timeout=cross_site_eval_timeout)
+        else:
+            cse_config = None
+
+        if not train_args:
+            train_args = {}
+        else:
+            # Validate train_args doesn't conflict with ScriptRunner reserved parameters
+            reserved_keys = {
+                "script",
+                "launch_external_process",
+                "command",
+                "framework",
+                "aggregation_format",
+                "server_expected_format",
+                "memory_gc_rounds",
+                "cuda_empty_cache",
+            }
+            conflicts = set(train_args.keys()) & reserved_keys
+            if conflicts:
+                raise ValueError(f"train_args contains reserved keys that conflict with ScriptRunner: {conflicts}")
+
+        # The persistor uses the exported basename for a relative checkpoint. The
+        # source file is added to the generated client apps after the base recipe
+        # creates its backing job.
+        ckpt_path = (
+            os.path.basename(initial_ckpt)
+            if initial_ckpt is not None and not os.path.isabs(initial_ckpt)
+            else initial_ckpt
+        )
+
+        server_config_args = merge_config_overrides(
+            {
+                "num_rounds": num_rounds,
+                "start_task_timeout": start_task_timeout,
+                "progress_timeout": progress_timeout,
+                "max_status_report_interval": max_status_report_interval,
+                "min_clients": min_clients,
+            },
+            validated_server_config_overrides,
+            "server_config_overrides",
+        )
+        server_config = SwarmServerConfig(**server_config_args)
+
+        client_config_args = {
+            "executor": ScriptRunner(
+                script=train_script,
+                launch_external_process=launch_external_process,
+                command=command,
+                memory_gc_rounds=memory_gc_rounds,
+                cuda_empty_cache=cuda_empty_cache,
+                server_expected_format=aggregation_format,
+                params_transfer_type=params_transfer_type,
+                **train_args,
+            ),
+            "aggregator": aggregator,
+            "persistor": PTFileModelPersistor(
+                model=model,
+                source_ckpt_file_full_name=ckpt_path,
+                allow_numpy_conversion=aggregation_format != ExchangeFormat.PYTORCH,
+            ),
+            "shareable_generator": SimpleModelShareableGenerator(),
+            "enable_tensor_disk_offload": enable_tensor_disk_offload,
+            "memory_gc_rounds": memory_gc_rounds,
+            "cuda_empty_cache": cuda_empty_cache,
+            "min_responses_required": min_clients,
+            "learn_task_timeout": learn_task_timeout,
+            "max_concurrent_submissions": max_concurrent_submissions,
+            "learn_task_ack_timeout": (round_timeout if learn_task_ack_timeout is None else learn_task_ack_timeout),
+            "final_result_ack_timeout": (
+                round_timeout if final_result_ack_timeout is None else final_result_ack_timeout
+            ),
+        }
+        if key_metric is not None:
+            client_config_args["model_selector"] = IntimeModelSelector(
+                key_metric=key_metric,
+                negate_key_metric=key_metric_mode == "min",
+            )
+        if learn_task_abort_timeout is not None:
+            client_config_args["learn_task_abort_timeout"] = learn_task_abort_timeout
+        client_config_args = merge_config_overrides(
+            client_config_args,
+            validated_client_config_overrides,
+            "client_config_overrides",
+        )
+        check_object_type(
+            "enable_tensor_disk_offload",
+            client_config_args["enable_tensor_disk_offload"],
+            bool,
+        )
+        self.enable_tensor_disk_offload = client_config_args["enable_tensor_disk_offload"]
+        if self.enable_tensor_disk_offload and self.aggregation_format != ExchangeFormat.PYTORCH:
+            warnings.warn(
+                "enable_tensor_disk_offload=True only applies to streamed PyTorch tensors. "
+                "Set aggregation_format=ExchangeFormat.PYTORCH to enable tensor disk offload; "
+                f"current aggregation_format={self.aggregation_format!r} will not offload NumPy payloads.",
+                UserWarning,
+                stacklevel=2,
+            )
+        check_positive_int("max_concurrent_submissions", client_config_args["max_concurrent_submissions"])
+        if client_config_args.get("learn_task_timeout") is not None:
+            check_positive_number("learn_task_timeout", client_config_args["learn_task_timeout"])
+        if client_config_args.get("learn_task_abort_timeout") is not None:
+            check_positive_number("learn_task_abort_timeout", client_config_args["learn_task_abort_timeout"])
+        client_config = SwarmClientConfig(**client_config_args)
+
+        BaseSwarmLearningRecipe.__init__(
+            self,
+            name,
+            server_config,
+            client_config,
+            cse_config,
+            min_clients=min_clients,
+        )
+        if initial_ckpt is not None and not os.path.isabs(initial_ckpt):
+            # FileSource copies the checkpoint basename into custom/, matching
+            # the path configured on the client-side PTFileModelPersistor above.
+            self._job.add_file_to_clients(initial_ckpt)

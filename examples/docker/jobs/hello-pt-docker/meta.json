@@ -1,0 +1,32 @@
+{
+    "name": "hello-pt",
+    "min_clients": 2,
+    "deploy_map": {
+        "app": ["site-1", "server", "site-2"]
+    },
+    "launcher_spec": {
+        "server": {
+            "docker": {"image": "nvflare-job:latest"}
+        },
+        "site-1": {
+            "docker": {
+                "image": "nvflare-job:latest",
+                "shm_size": "8g"
+            }
+        },
+        "site-2": {
+            "docker": {
+                "image": "nvflare-job:latest",
+                "shm_size": "8g"
+            }
+        }
+    },
+    "resource_spec": {
+        "site-1": {
+            "num_of_gpus": 1
+        },
+        "site-2": {
+            "num_of_gpus": 1
+        }
+    }
+}

@@ -1,0 +1,5 @@
+nvflare~=2.7.2rc
+torch
+torchvision
+pytorch_lightning
+tensorboard

@@ -1,0 +1,30 @@
+{
+    "format_version": 2,
+    "executors": [
+        {
+            "tasks": [
+                "*"
+            ],
+            "executor": {
+                "path": "nvflare.app_common.executors.client_api_executor.ClientAPIExecutor",
+                "args": {
+                    "execution_mode": "external_process",
+                    "command": [
+                        "python3",
+                        "-m",
+                        "torch.distributed.run",
+                        "--nnodes=1",
+                        "--nproc_per_node=2",
+                        "--master_port=8888",
+                        "custom/client.py"
+                    ],
+                    "params_exchange_format": "pytorch",
+                    "server_expected_format": "numpy"
+                }
+            }
+        }
+    ],
+    "components": [],
+    "task_data_filters": [],
+    "task_result_filters": []
+}

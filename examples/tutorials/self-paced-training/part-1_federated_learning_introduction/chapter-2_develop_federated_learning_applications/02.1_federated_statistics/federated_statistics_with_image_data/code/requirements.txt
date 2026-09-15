@@ -1,0 +1,9 @@
+nvflare~=2.7.2rc
+numpy
+monai[itk]
+pandas~=2.3
+kaleido
+matplotlib
+jupyter
+notebook
+tdigest

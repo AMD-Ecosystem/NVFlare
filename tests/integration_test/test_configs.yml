@@ -1,0 +1,35 @@
+test_configs:
+  auth:
+    - ./data/test_configs/authorization/test_diff_job_config.yml
+    - ./data/test_configs/authorization/submit_job.yml
+    - ./data/test_configs/authorization/clone_job.yml
+    - ./data/test_configs/authorization/abort_job.yml
+    - ./data/test_configs/authorization/list_job.yml
+    - ./data/test_configs/authorization/shell_commands.yml
+  numpy:
+    - ./data/test_configs/standalone_job/np_job.yml
+    - ./data/test_configs/standalone_job/np_app.yml
+    - ./data/test_configs/standalone_job/hello_numpy_recipe_examples.yml
+  tensorflow:
+    - ./data/test_configs/standalone_job/tf_job.yml
+    - ./data/test_configs/standalone_job/tf_app.yml
+  pytorch:
+    - ./data/test_configs/standalone_job/pt_job.yml
+    - ./data/test_configs/standalone_job/pt_app.yml
+  cifar:
+    - ./data/test_configs/standalone_job/cifar_examples.yml
+  stats:
+    - ./data/test_configs/standalone_job/image_stats.yml
+  xgboost:
+    - ./data/test_configs/standalone_job/xgb_histogram.yml
+    - ./data/test_configs/standalone_job/xgb_tree.yml
+  client_api:
+    - ./data/test_configs/standalone_job/client_api_poc.yml
+    - ./data/test_configs/standalone_job/client_api_prod.yml
+    - ./data/test_configs/standalone_job/ext_process_streaming.yml
+    - ./data/test_configs/standalone_job/swarm_external_process_pass_through.yml
+    - ./data/test_configs/standalone_job/swarm_tensor_disk_offload.yml
+    - ./data/test_configs/standalone_job/client_api_attach_ccwf.yml
+    - ./data/test_configs/standalone_job/model_controller_api.yml
+  client_api_qa:
+    - ./data/test_configs/standalone_job/client_api_qa.yml

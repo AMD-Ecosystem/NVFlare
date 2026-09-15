@@ -1,0 +1,6 @@
+nvflare[HE]~=2.9.0rc
+torch
+torchvision
+tensorboard
+lifelines
+matplotlib

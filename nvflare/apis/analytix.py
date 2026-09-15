@@ -1,0 +1,282 @@
+# Copyright (c) 2021, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from enum import Enum
+
+from nvflare.apis.dxo import DXO, DataKind
+
+ANALYTIC_EVENT_TYPE = "analytix_log_stats"
+
+
+class LogWriterName(Enum):
+    TORCH_TB = "TORCH_TENSORBOARD"
+    MLFLOW = "MLFLOW"
+    WANDB = "WEIGHTS_AND_BIASES"
+
+
+class TrackConst:
+    TRACKER_KEY = "tracker_key"
+
+    TRACK_KEY = "track_key"
+    TRACK_VALUE = "track_value"
+
+    TAG_KEY = "tag_key"
+    TAGS_KEY = "tags_key"
+
+    EXP_TAGS_KEY = "tags_key"
+
+    GLOBAL_STEP_KEY = "global_step"
+    PATH_KEY = "path"
+    DATA_TYPE_KEY = "analytics_data_type"
+    KWARGS_KEY = "analytics_kwargs"
+
+    PROJECT_NAME = "project_name"
+    PROJECT_TAGS = "project_name"
+
+    EXPERIMENT_NAME = "experiment_name"
+    RUN_NAME = "run_name"
+    EXPERIMENT_TAGS = "experiment_tags"
+    INIT_CONFIG = "init_config"
+    RUN_TAGS = "run_tags"
+
+    SITE_KEY = "site"
+    JOB_ID_KEY = "job_id"
+
+
+class AnalyticsDataType(Enum):
+    SCALARS = "SCALARS"
+    SCALAR = "SCALAR"
+    IMAGE = "IMAGE"
+    TEXT = "TEXT"
+    LOG_RECORD = "LOG_RECORD"
+
+    PARAMETER = "PARAMETER"
+    PARAMETERS = "PARAMETERS"
+    METRIC = "METRIC"
+    METRICS = "METRICS"
+    MODEL = "MODEL"
+
+    #     # MLFLOW ONLY
+    TAG = "TAG"
+    TAGS = "TAGS"
+    INIT_DATA = "INIT_DATA"
+
+
+class AnalyticsData:
+    def __init__(
+        self,
+        key: str,
+        value,
+        data_type: AnalyticsDataType,
+        sender: LogWriterName = LogWriterName.TORCH_TB,
+        **kwargs,
+    ):
+        """This class defines AnalyticsData format.
+
+        It is a wrapper to provide to/from DXO conversion.
+
+        Args:
+            key (str): tag name
+            value: value
+            data_type (AnalyticDataType): type of the analytic data.
+            sender (LogWriterName): Type of sender for syntax such as Tensorboard or MLflow
+            kwargs (optional, dict): additional arguments to be passed.
+        """
+        step = kwargs.get(TrackConst.GLOBAL_STEP_KEY, None)
+        if step is not None:
+            kwargs[TrackConst.GLOBAL_STEP_KEY] = self._normalize_global_step(step)
+        value = self._validate_data_types(data_type, key, value, **kwargs)
+        self.tag = key
+        self.value = value
+        self.data_type = data_type
+        self.kwargs = kwargs
+        self.sender = sender
+        self.step = kwargs.get(TrackConst.GLOBAL_STEP_KEY, None)
+        self.path = kwargs.get(TrackConst.PATH_KEY, None)
+
+    def to_dxo(self):
+        """Converts the AnalyticsData to DXO object.
+
+        Returns:
+            DXO object
+        """
+
+        data = {TrackConst.TRACK_KEY: self.tag, TrackConst.TRACK_VALUE: self.value}
+        if self.step is not None:
+            data[TrackConst.GLOBAL_STEP_KEY] = self.step
+        if self.path:
+            data[TrackConst.PATH_KEY] = self.path
+        if self.kwargs:
+            data[TrackConst.KWARGS_KEY] = self.kwargs
+        dxo = DXO(data_kind=DataKind.ANALYTIC, data=data)
+        dxo.set_meta_prop(TrackConst.DATA_TYPE_KEY, self.data_type)
+        dxo.set_meta_prop(TrackConst.TRACKER_KEY, self.sender)
+        return dxo
+
+    @classmethod
+    def from_dxo(cls, dxo: DXO, receiver: LogWriterName = LogWriterName.TORCH_TB):
+        """Generates the AnalyticsData from DXO object.
+
+        Args:
+            receiver: type of the experiment tacker, defaults to Tensorboard with LogWriterName.TORCH_TB.
+            dxo (DXO): The DXO object to convert.
+
+        Returns:
+            AnalyticsData object
+        """
+        if not isinstance(dxo, DXO):
+            raise TypeError(f"expect dxo to be an instance of DXO, but got {type(dxo)}.")
+
+        if len(dxo.data) == 0:
+            raise ValueError(
+                "dxo does not have the correct format for AnalyticsData; expected dxo.data to be length > 0, but got 0"
+            )
+        data = dxo.data
+        key = data[TrackConst.TRACK_KEY]
+        value = data[TrackConst.TRACK_VALUE]
+        kwargs = data.get(TrackConst.KWARGS_KEY, {})
+        step = data.get(TrackConst.GLOBAL_STEP_KEY, None)
+        if step is not None:
+            kwargs[TrackConst.GLOBAL_STEP_KEY] = step
+        data_type = dxo.get_meta_prop(TrackConst.DATA_TYPE_KEY)
+        writer = dxo.get_meta_prop(TrackConst.TRACKER_KEY)
+        if writer is not None and writer != receiver:
+            data_type = cls.convert_data_type(data_type, writer, receiver)
+
+        if not data_type:
+            return None
+
+        if not kwargs:
+            return cls(key, value, data_type, writer)
+        else:
+            return cls(key, value, data_type, writer, **kwargs)
+
+    def _validate_data_types(
+        self,
+        data_type: AnalyticsDataType,
+        key: str,
+        value: any,
+        **kwargs,
+    ):
+        if not isinstance(key, str):
+            raise TypeError(f"expect tag to be an instance of str, but got {type(key)}.")
+        if not isinstance(data_type, AnalyticsDataType):
+            raise TypeError(f"expect data_type to be an instance of AnalyticsDataType, but got {type(data_type)}.")
+        if kwargs and not isinstance(kwargs, dict):
+            raise TypeError(f"expect kwargs to be an instance of dict, but got {type(kwargs)}.")
+        path = kwargs.get(TrackConst.PATH_KEY, None)
+        if path is not None and not isinstance(path, str):
+            raise TypeError(f"expect path to be an instance of str, but got {type(path)}.")
+        if data_type in [AnalyticsDataType.SCALAR, AnalyticsDataType.METRIC]:
+            is_numeric_scalar, normalized_value = self._normalize_numeric_scalar(value)
+            if not is_numeric_scalar:
+                raise TypeError(
+                    f"expect '{key}' value to be a numeric scalar "
+                    f"(float/int or scalar-like with item()), but got '{type(value)}'."
+                )
+            value = normalized_value
+        elif data_type in [
+            AnalyticsDataType.METRICS,
+            AnalyticsDataType.PARAMETERS,
+            AnalyticsDataType.SCALARS,
+        ]:
+            if not isinstance(value, dict):
+                raise TypeError(f"expect '{key}' value to be an instance of dict, but got '{type(value)}'.")
+            if data_type in [AnalyticsDataType.METRICS, AnalyticsDataType.SCALARS]:
+                normalized_dict = {}
+                for k, v in value.items():
+                    is_numeric_scalar, normalized_value = self._normalize_numeric_scalar(v)
+                    if not is_numeric_scalar:
+                        raise TypeError(
+                            f"expect all values in '{key}' dict to be numeric scalars, "
+                            f"but got '{type(v)}' for key '{k}'."
+                        )
+                    normalized_dict[k] = normalized_value
+                value = normalized_dict
+        elif data_type == AnalyticsDataType.TEXT and not isinstance(value, str):
+            raise TypeError(f"expect '{key}' value to be an instance of str, but got '{type(value)}'.")
+        elif data_type == AnalyticsDataType.TAGS and not isinstance(value, dict):
+            raise TypeError(
+                f"expect '{key}' data type expects value to be an instance of dict, but got '{type(value)}'"
+            )
+        return value
+
+    def _normalize_global_step(self, step):
+        is_numeric_scalar, normalized_step = self._normalize_numeric_scalar(step)
+        if not is_numeric_scalar or not isinstance(normalized_step, int):
+            raise TypeError(f"expect step to be an instance of int, but got {type(step)}.")
+        if normalized_step < 0:
+            raise ValueError(f"expect step to be non-negative int, but got {normalized_step}.")
+        return normalized_step
+
+    @staticmethod
+    def _normalize_numeric_scalar(value):
+        if isinstance(value, (float, int)):
+            return True, value
+
+        item = getattr(value, "item", None)
+        if not callable(item):
+            return False, value
+
+        shape = getattr(value, "shape", None)
+        if shape is not None:
+            try:
+                if tuple(shape) != ():
+                    return False, value
+            except TypeError:
+                return False, value
+
+        try:
+            scalar = item()
+        except (TypeError, ValueError):
+            return False, value
+
+        if isinstance(scalar, (float, int)):
+            return True, scalar
+        return False, value
+
+    @classmethod
+    def convert_data_type(
+        cls, sender_data_type: AnalyticsDataType, sender: LogWriterName, receiver: LogWriterName
+    ) -> AnalyticsDataType:
+
+        # TensorBoard naming → MLflow/W&B naming
+        if sender == LogWriterName.TORCH_TB and (receiver == LogWriterName.MLFLOW or receiver == LogWriterName.WANDB):
+            if AnalyticsDataType.SCALAR == sender_data_type:
+                return AnalyticsDataType.METRIC
+            elif AnalyticsDataType.SCALARS == sender_data_type:
+                return AnalyticsDataType.METRICS
+            else:
+                return sender_data_type
+
+        # MLflow/W&B naming → TensorBoard naming
+        if (sender == LogWriterName.MLFLOW or sender == LogWriterName.WANDB) and receiver == LogWriterName.TORCH_TB:
+            if AnalyticsDataType.METRIC == sender_data_type:
+                return AnalyticsDataType.SCALAR
+            elif AnalyticsDataType.METRICS == sender_data_type:
+                return AnalyticsDataType.SCALARS
+            else:
+                return sender_data_type
+
+        # MLflow and W&B share the same METRIC/METRICS naming, so cross-mapping is a pass-through.
+        if (sender == LogWriterName.MLFLOW and receiver == LogWriterName.WANDB) or (
+            sender == LogWriterName.WANDB and receiver == LogWriterName.MLFLOW
+        ):
+            return sender_data_type
+
+        # Same sender/receiver, or any combination not covered above: pass through unchanged.
+        return sender_data_type
+
+    def __str__(self) -> str:
+        return f"AnalyticsData(tag: {self.tag}, value: {self.value}, data_type: {self.data_type}, kwargs: {self.kwargs}, step: {self.step})"

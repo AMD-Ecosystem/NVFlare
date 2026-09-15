@@ -1,0 +1,8 @@
+nvflare~=2.9.0rc
+torch
+torchvision
+tensorboard
+matplotlib
+seaborn
+pandas~=2.3
+tbparse

@@ -1,0 +1,363 @@
+
+Hello Pytorch Lightning
+=======================
+
+This example demonstrates how to use NVIDIA FLARE with PyTorch Lightning to train an image classifier using
+federated averaging (FedAvg), FedProx, or SCAFFOLD. The same patched client works with all three configurations.
+The complete example code can be found in the
+:github_nvflare_link:`hello-lightning directory <examples/hello-world/hello-lightning>`.
+
+It is recommended to create a virtual environment and run everything within a virtualenv.
+
+
+NVIDIA FLARE Installation
+-------------------------
+
+For the complete installation instructions, see :doc:`Installation </installation>`. Install the example
+dependencies with:
+
+.. code-block:: bash
+
+   python -m pip install -r requirements.txt
+
+get the example code from github:
+
+.. code-block:: text
+
+   git clone https://github.com/NVIDIA/NVFlare.git
+
+then navigate to the hello-lightning directory:
+
+.. code-block:: text
+
+    cd NVFlare
+    git switch <release branch>
+    cd examples/hello-world/hello-lightning
+
+Code Structure
+--------------
+
+.. code-block:: text
+
+    .
+ hello-lightning
+    |
+    |-- client.py        # client local training script
+    |-- model.py         # model definition
+    |-- job.py           # job recipe that defines client and server configurations
+    |-- prepare_data.py  # one-time CIFAR-10 download
+    |-- requirements.txt # dependencies
+
+Data
+-----------------
+This example uses the `CIFAR-10 <https://www.cs.toronto.edu/~kriz/cifar.html>`_ dataset
+
+In a real FL experiment, each client would have their own dataset used for local training.
+For simplicity, this example uses the same CIFAR-10 dataset on every client.
+
+Download CIFAR-10 once before the first non-synthetic run. The client and job load the prepared files with
+``download=False``, so later runs do not repeat data preparation.
+
+.. code-block:: text
+
+    python prepare_data.py
+
+The default destination is ``/tmp/nvflare/data``. To use another location, pass the same ``--data_root`` value
+to ``prepare_data.py`` and ``job.py``.
+
+.. literalinclude:: ../../../examples/hello-world/hello-lightning/prepare_data.py
+    :language: python
+    :linenos:
+    :caption: prepare_data.py
+
+In PyTorch Lightning, a `LightningDataModule` is a standardized way to handle data loading and processing. It encapsulates all the steps required to prepare data for training, validation, and testing, making it easier to manage datasets and data loaders in a clean and organized manner. This abstraction helps separate data-related logic from the model and training code, promoting better code organization and reusability.
+
+`LightningDataModule`
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+- **Purpose:** The `LightningDataModule` encapsulates transforming and splitting datasets and provides data loaders for training, validation, testing, and prediction.
+
+- **Key Methods:**
+  - `setup(stage)`: Used to set up datasets for different stages (e.g., 'fit', 'validate', 'test', 'predict'). This method is called on every GPU or node.
+  - `train_dataloader()`, `val_dataloader()`, `test_dataloader()`, `predict_dataloader()`: These methods return the respective data loaders for each stage.
+
+Setup of `DataModule`
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+In the `CIFAR10DataModule`, we have implemented the following:
+
+- **Initialization (`__init__`):** The constructor initializes the data directory and batch size, which are used throughout the data module.
+
+- **Setup (`setup`):** This method assigns datasets for different stages:
+  - For the 'fit' and 'validate' stages, it splits the CIFAR-10 training dataset into training and validation sets.
+  - For the 'test' and 'predict' stages, it assigns the test dataset.
+
+- **Data Loaders:** The module provides data loaders for training, validation, testing, and prediction, each configured with the specified batch size.
+
+By using a `LightningDataModule`, the data handling logic is neatly encapsulated, making it easier to manage and modify data-related operations without affecting the rest of the training code.
+
+.. literalinclude:: ../../../examples/hello-world/hello-lightning/client.py
+    :language: python
+    :linenos:
+    :caption: data module
+    :lines: 16-74
+
+
+Model
+------------------
+In PyTorch Lightning, a `LightningModule` is a high-level abstraction built
+on top of PyTorch that streamlines the process of training models. It
+encapsulates the model architecture, training, validation, and testing logic,
+allowing developers to focus on the core components of their models without
+getting bogged down by the boilerplate code typically associated with PyTorch.
+
+General Summary of a `LightningModule`
+
+- **Model Definition:** The `LightningModule` is initialized with the model
+  architecture, which is defined using PyTorch's `nn.Module`. This includes
+  layers, activation functions, and any other components necessary for the
+  model.
+
+- **Forward Pass:** The `forward` method specifies how the input data flows
+  through the model. This is where the core computation of the model is
+  defined.
+
+- **Training Logic:** The `training_step` method contains the logic for a
+  single training iteration. It computes the loss and any metrics you wish to
+  track, such as accuracy. This method is called automatically during the
+  training loop.
+
+- **Validation and Testing:** Similar to the training step, the
+  `validation_step` and `test_step` methods define how the model is evaluated
+  on validation and test datasets, respectively. These methods help in
+  monitoring the model's performance and generalization.
+
+- **Optimizer Configuration:** The `configure_optimizers` method specifies the
+  optimizer(s) and learning rate scheduler(s) used during training. This
+  allows for flexible and customizable training strategies.
+
+By using a `LightningModule`, developers can leverage PyTorch Lightning's
+features like distributed training, automatic checkpointing, and logging,
+making it easier to scale experiments and manage complex training workflows.
+This abstraction promotes cleaner code, better organization, and easier
+debugging, ultimately accelerating the model development process.
+
+.. literalinclude:: ../../../examples/hello-world/hello-lightning/model.py
+    :language: python
+    :linenos:
+    :caption: model.py
+    :lines: 14-
+
+--------------
+
+
+Client Code
+------------------
+
+Notice the training code is almost identical to the pytorch lightning standard training code.
+The only difference is that we added a few lines to receive and send data to the server.
+We mark all the changed code with number 0 to 4 to make it easier to understand.
+
+
+.. literalinclude:: ../../../examples/hello-world/hello-lightning/client.py
+    :language: python
+    :linenos:
+    :caption: client.py
+    :lines: 77-
+
+
+The main flow of the code logic in the `client.py` file involves running a federated learning (FL) training logics locally on each client using PyTorch Lightning and NVFlare. 
+Here's a breakdown of the key steps:
+
+1. **Argument Parsing:**
+
+   - The `define_parser()` function parses the batch size, prepared-data root, optional batch limit, and
+     synthetic-data mode.
+
+2. **Initialization:**
+
+   - The `main()` function begins by parsing the command-line arguments to get the batch size.
+   - The `flare.init()` function is called to initialize the NVFlare client, which is necessary for using certain NVFlare functions like `flare.get_site_name()`.
+
+3. **Model and Data Module Setup:**
+
+   - An instance of `LitNet`, a PyTorch Lightning model, is created.
+   - An instance of `CIFAR10DataModule` is created with the specified data root and batch size to handle data
+     loading and processing.
+
+4. **Trainer Configuration:**
+
+   - A PyTorch Lightning `Trainer` is configured. If a GPU is available, it is set to use it; otherwise, it defaults to CPU.
+
+5. **NVFlare Integration:**
+
+   - The `flare.patch(trainer)` function is called to integrate NVFlare with the PyTorch Lightning trainer. This allows the trainer to handle federated learning tasks.
+   - When ``ScaffoldRecipe`` sends SCAFFOLD controls, the patch automatically applies the required
+     ``PTScaffoldHelper`` updates and returns the control difference. This path requires Lightning automatic
+     optimization with one optimizer.
+   - When a PyTorch recipe sends a positive ``fedprox_mu``, the patch automatically injects the FedProx
+     proximal gradient.
+
+6. **Federated Learning Loop:**
+
+   - A loop runs while `flare.is_running()` returns `True`, indicating that the federated learning job is active.
+   - Within the loop:
+      - The global model is received from the NVFlare server using `flare.receive()`.
+      - The current round and site name are printed for logging purposes.
+      - The global model is validated using `trainer.validate()`.
+      - Local training is performed using `trainer.fit()`, starting with the received global model.
+      - The local model is tested using `trainer.test()`.
+      - Predictions are made using `trainer.predict()`.
+
+7. **Execution:**
+
+   - The `main()` function is executed if the script is run as the main module, starting the entire process.
+
+
+Server Code
+------------------
+In federated averaging, the server code is responsible for
+aggregating model updates from clients, the workflow pattern is similar to scatter-gather.
+In this example, we will directly use the default federated averaging algorithm provided by NVFlare.
+The FedAvg class is defined in `nvflare.app_common.workflows.fedavg.FedAvg`
+There is no need to defined a customized server code for this example.
+
+
+Job Recipe Code
+------------------
+The job recipe code is used to define the client and server configurations.
+
+.. literalinclude:: ../../../examples/hello-world/hello-lightning/job.py
+    :language: python
+    :linenos:
+    :caption: Job Recipe (job.py)
+    :lines: 14-
+
+Model Input Options
+^^^^^^^^^^^^^^^^^^^
+
+The ``model`` parameter accepts two formats:
+
+1. **Class instance**: ``model=LitNet()`` - Convenient and Pythonic
+2. **Dict config**: ``model={"class_path": "model.LitNet", "args": {}}`` - Better for large models
+
+To resume from pre-trained weights:
+
+.. code-block:: python
+
+   recipe = FedAvgRecipe(
+       model=LitNet(),
+       initial_ckpt="/server/path/to/pretrained.pt",  # Absolute path
+       ...
+   )
+
+
+Run FL Job
+------------------
+
+This section provides the command to execute the federated learning job
+using the job recipe defined above. Run this command in your terminal.
+Before the first non-synthetic run, prepare the data once:
+
+.. code-block:: text
+
+  python prepare_data.py
+
+
+**Command to execute the FL job**
+
+Use the following command in your terminal to start the job with the specified
+number of rounds, batch size, and number of clients.
+
+
+.. code-block:: text
+
+  python job.py --num_rounds 2 --batch_size 16
+
+FedAvg is the default. The same client can run every configuration without changing its training loop:
+
+.. code-block:: text
+
+  python job.py --algorithm fedprox --fedprox_mu 0.01 --num_rounds 2 --batch_size 16
+  python job.py --algorithm scaffold --num_rounds 2 --batch_size 16
+
+For a quick simulator smoke test without downloading CIFAR-10, add
+``--synthetic_data --limit_batches 1``. Normal runs use CIFAR-10, and the default batch limit ``0`` runs every
+batch.
+
+``FedProxRecipe(fedprox_mu=...)`` sends the coefficient on every training round. The patch snapshots the global
+optimizer-owned trainable parameters and injects ``mu * (local - global)`` after gradient accumulation and AMP
+unscaling but before gradient clipping. The loss returned or logged by ``training_step`` excludes the injected
+proximal term, while optimization includes its exact gradient.
+
+Automatic injection requires ``flare.patch(trainer)``. Setting ``fedprox_mu`` does not change an unpatched or raw
+PyTorch client; integrate ``PTFedProxLoss`` explicitly in that case. While a positive coefficient is active, the
+patch keeps an additional device-resident snapshot of every optimizer-owned trainable parameter for the round.
+Custom controllers may change the coefficient between rounds and must keep sending ``FEDPROX_MU``: use an explicit
+``0.0`` to disable a scheduled round. Omitting the key after the schedule has started raises an error.
+
+For manual Lightning optimization, use an explicit receive/train/send loop without ``flare.patch(trainer)``
+and integrate the selected algorithms directly.
+
+The automatic FedProx and SCAFFOLD paths support one optimizer with ``precision="32-true"`` or
+``precision="bf16-mixed"``. SCAFFOLD additionally requires equal finite, non-negative learning rates across
+parameter groups at every step. Starting with NVFlare 2.9.0, PyTorch SCAFFOLD control differences contain
+trainable parameters only; buffers such as BatchNorm running statistics remain ordinary model state. Custom
+SCAFFOLD aggregators must accept sparse control dictionaries. Trainability may change between rounds, which
+resets newly trainable local controls to zero, but ``requires_grad`` must not change during a round.
+
+
+output
+
+.. code-block:: text
+
+
+.. code-block:: Python
+   :dedent: 1
+
+        # < ... skip few lines of logs ..>
+        # 2025-07-22 18:45:45,758 - INFO - Start FedAvg.
+        # 2025-07-22 18:45:45,759 - INFO - loading initial model from persistor
+        # 2025-07-22 18:45:45,759 - INFO - Both source_ckpt_file_full_name and ckpt_preload_path are not provided. Using the default model weights initialized on the persistor side.
+        # 2025-07-22 18:45:45,760 - INFO - Round 0 started.
+        # 2025-07-22 18:45:45,760 - INFO - Sampled clients: ['site-1', 'site-2']
+        # 2025-07-22 18:45:45,760 - INFO - Sending task train to ['site-1', 'site-2']
+        #
+        # < ... skip .. few lines of logs ..>
+        #
+        # 2025-07-22 18:45:50,507 - INFO - batch_size=16, site=site-1
+        # 2025-07-22 18:45:50,543 - INFO -
+        # [Current Round=0, Site = site-1]
+        #
+        # 2025-07-22 18:45:50,543 - INFO - --- validate global model ---
+        # 2025-07-22 18:45:50,578 - INFO - batch_size=16, site=site-2
+        # 2025-07-22 18:45:50,656 - INFO -
+        # [Current Round=0, Site = site-2]
+        #
+        # 2025-07-22 18:45:50,656 - INFO - --- validate global model ---
+        #
+        # < ... skip .. few lines of logs ..>
+        #
+        # ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        # ┃        Test metric        ┃       DataLoader 0        ┃
+        # ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        # │      test_acc_epoch       │    0.44699999690055847    │
+        # │         test_loss         │    1.5125484466552734     │
+        # └───────────────────────────┴───────────────────────────┘
+        # Testing DataLoader 0:  68%|████████████████████████████████▍               | 422/625 [00:01<00:00, 276.33it/s]2025-07-22 18:46:39,629 - INFO - --- prediction with new best model ---
+        # Testing DataLoader 0:  76%|████████████████████████████████████▋           | 478/625 [00:01<00:00, 275.61it/s]2025-07-22 18:46:39,837 - INFO - Files already downloaded and verified
+        # Testing DataLoader 0: 100%|████████████████████████████████████████████████| 625/625 [00:02<00:00, 275.79it/s]
+        # ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        # ┃        Test metric        ┃       DataLoader 0        ┃
+        # ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        # │      test_acc_epoch       │    0.44699999690055847    │
+        # │         test_loss         │    1.5125484466552734     │
+        # └───────────────────────────┴───────────────────────────┘
+        # 2025-07-22 18:46:40,370 - INFO - --- prediction with new best model ---
+        # 2025-07-22 18:46:40,431 - INFO - Files already downloaded and verified
+        # 2025-07-22 18:46:40,577 - INFO - Files already downloaded and verified
+        # Predicting DataLoader 0:  16%|███████▍                                     | 103/625 [00:00<00:01, 371.90it/s]2025-07-22 18:46:41,191 - INFO - Files already downloaded and verified
+        # Predicting DataLoader 0: 100%|█████████████████████████████████████████████| 625/625 [00:01<00:00, 367.54it/s]
+        # Predicting DataLoader 0:  53%|███████████████████████▊                     | 331/625 [00:00<00:00, 346.29it/s]2025-07-22 18:46:42,615 - WARNING - request to stop the job for reason END_RUN received
+        # Predicting DataLoader 0: 100%|█████████████████████████████████████████████| 625/625 [00:01<00:00, 344.12it/s]
+        # 2025-07-22 18:46:43,476 - WARNING - request to stop the job for reason END_RUN received

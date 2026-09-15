@@ -1,0 +1,189 @@
+# Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import copy
+from typing import List
+
+import numpy as np
+
+from nvflare.app_common.abstract.fl_model import FLModel
+from nvflare.app_common.aggregators.weighted_aggregation_helper import WeightedAggregationHelper
+from nvflare.app_common.app_constant import AlgorithmConstants, AppConstants
+from nvflare.app_common.utils.tensor_disk_offload_context import cleanup_tensor_disk_offload, setup_tensor_disk_offload
+
+from .base_fedavg import (
+    BaseFedAvg,
+    _aggregate_fl_model_metrics,
+    _get_client_name,
+    _get_num_steps_weight,
+    make_fedavg_metrics_aggregation_info,
+)
+
+
+def _zero_control_value(value):
+    """Zero an array or tensor in place without changing its type, dtype, or device."""
+    try:
+        value[...] = 0
+    except (IndexError, TypeError):
+        value = np.zeros_like(value)
+    return value
+
+
+def _add_control_delta(control, delta):
+    """Add a control delta while preserving a tensor control's dtype and device."""
+    new_tensor = getattr(control, "new_tensor", None)
+    add = getattr(control, "add_", None)
+    if callable(new_tensor) and callable(add) and not callable(getattr(delta, "new_tensor", None)):
+        add(new_tensor(delta))
+        return control
+    control += delta
+    return control
+
+
+class Scaffold(BaseFedAvg):
+    """Controller for Scaffold Workflow. *Note*: This class is based on `ModelController`.
+    Implements [SCAFFOLD](https://proceedings.mlr.press/v119/karimireddy20a.html).
+
+    Provides the implementations for the `run` routine, controlling the main workflow:
+        - def run(self)
+
+    The parent classes provide the default implementations for other routines.
+
+    Args:
+        num_clients (int, optional): The number of clients. Defaults to 3.
+        num_rounds (int, optional): The total number of training rounds. Defaults to 5.
+        persistor_id (str, optional): ID of the persistor component. Defaults to "persistor".
+        ignore_result_error (bool or None, optional): How to handle client result errors.
+            - None: Dynamic mode (default) - ignore errors if min_responses still reachable, panic otherwise.
+            - False: Strict mode - panic on any client error.
+            - True: Resilient mode - always ignore client errors.
+        allow_empty_global_weights (bool, optional): whether to allow empty global weights. Some pipelines can have
+            empty global weights at first round, such that clients start training from scratch without any global info.
+            Defaults to False.
+        memory_gc_rounds (int, optional): Run memory cleanup (gc.collect + malloc_trim) every N rounds.
+            Set to 0 to disable. Defaults to 0 (inherited from BaseFedAvg).
+        enable_tensor_disk_offload (bool, optional): Download tensors to disk during FOBS streaming
+            instead of holding them in memory, reducing server memory pressure for large models.
+            Only applies to streamed PyTorch tensor payloads. Defaults to False.
+    """
+
+    def __init__(self, *args, enable_tensor_disk_offload: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.enable_tensor_disk_offload = enable_tensor_disk_offload
+
+    def initialize(self, fl_ctx):
+        super().initialize(fl_ctx)
+        self.model = self.load_model()
+        self.model.start_round = self.start_round
+        self.model.total_rounds = self.num_rounds
+
+        self._global_ctrl_weights = copy.deepcopy(self.model.params)
+        # Initialize correction term with zeros
+        for k in self._global_ctrl_weights.keys():
+            self._global_ctrl_weights[k] = _zero_control_value(self._global_ctrl_weights[k])
+
+    def run(self) -> None:
+        disk_offload_context = None
+        try:
+            disk_offload_context = setup_tensor_disk_offload(
+                engine=getattr(self, "engine", None),
+                enabled=self.enable_tensor_disk_offload,
+                job_id=self.fl_ctx.get_job_id("job"),
+            )
+            if self.enable_tensor_disk_offload and not disk_offload_context.applied:
+                self.warning(
+                    "enable_tensor_disk_offload=True but no active cell is available; "
+                    "falling back to in-memory tensor download"
+                )
+            self._run_rounds()
+        finally:
+            cleanup_tensor_disk_offload(engine=getattr(self, "engine", None), context=disk_offload_context)
+
+    def _run_rounds(self) -> None:
+        self.info("Start Scaffold.")
+
+        for self.current_round in range(self.start_round, self.start_round + self.num_rounds):
+            self.info(f"Round {self.current_round} started.")
+            self.model.current_round = self.current_round
+
+            clients = self.sample_clients(self.num_clients)
+
+            # Add SCAFFOLD global control terms to global model meta
+            global_model = self.model
+            global_model.meta[AlgorithmConstants.SCAFFOLD_CTRL_GLOBAL] = self._global_ctrl_weights
+
+            results = self.send_model_and_wait(targets=clients, data=global_model)
+
+            aggregate_results = self.aggregate(results, aggregate_fn=scaffold_aggregate_fn)
+
+            self.model = self.update_model(self.model, aggregate_results)
+
+            # update SCAFFOLD global controls
+            ctr_diff = aggregate_results.meta[AlgorithmConstants.SCAFFOLD_CTRL_DIFF]
+            for v_name, v_value in ctr_diff.items():
+                if v_name not in self._global_ctrl_weights:
+                    if v_name not in self.model.params:
+                        raise RuntimeError(f"SCAFFOLD control delta contains unknown model parameter '{v_name}'.")
+                    self._global_ctrl_weights[v_name] = _zero_control_value(copy.deepcopy(self.model.params[v_name]))
+                self._global_ctrl_weights[v_name] = _add_control_delta(self._global_ctrl_weights[v_name], v_value)
+
+            self.save_model(self.model)
+
+            # Memory cleanup at end of round (if configured)
+            self._maybe_cleanup_memory()
+
+        self.info("Finished Scaffold.")
+
+
+def scaffold_aggregate_fn(results: List[FLModel]) -> FLModel:
+    # aggregates both the model weights and the SCAFFOLD control terms
+
+    aggregation_helper = WeightedAggregationHelper()
+    crtl_aggregation_helper = WeightedAggregationHelper()
+    for _result in results:
+        weight = _get_num_steps_weight(_result)
+        contributor_name = _get_client_name(_result)
+        aggregation_helper.add(
+            data=_result.params,
+            weight=weight,
+            contributor_name=contributor_name,
+            contribution_round=_result.current_round,
+        )
+        if AlgorithmConstants.SCAFFOLD_CTRL_DIFF not in _result.meta:
+            raise ValueError(
+                f"Client '{contributor_name}' did not return required "
+                f"FLModel.meta['{AlgorithmConstants.SCAFFOLD_CTRL_DIFF}'] for Scaffold aggregation."
+            )
+        crtl_aggregation_helper.add(
+            data=_result.meta[AlgorithmConstants.SCAFFOLD_CTRL_DIFF],
+            weight=weight,
+            contributor_name=contributor_name,
+            contribution_round=_result.current_round,
+        )
+
+    aggregated_dict = aggregation_helper.get_result()
+
+    aggr_result = FLModel(
+        params=aggregated_dict,
+        params_type=results[0].params_type,
+        metrics=_aggregate_fl_model_metrics(results),
+        meta={
+            AlgorithmConstants.SCAFFOLD_CTRL_DIFF: crtl_aggregation_helper.get_result(),
+            "nr_aggregated": len(results),
+            "current_round": results[0].current_round,
+            AppConstants.METRICS_AGGREGATION_INFO: make_fedavg_metrics_aggregation_info(),
+        },
+    )
+
+    return aggr_result

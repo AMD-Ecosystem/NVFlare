@@ -1,0 +1,822 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for Swarm Learning recipes."""
+
+import json
+from unittest.mock import patch
+
+import pytest
+
+from nvflare.apis.dxo import DataKind
+from nvflare.apis.job_def import ALL_SITES, SERVER_SITE_NAME
+from nvflare.app_common.app_constant import DefaultCheckpointFileName
+from nvflare.app_common.widgets.intime_model_selector import IntimeModelSelector
+from nvflare.app_opt.pt.file_model_persistor import PTFileModelPersistor
+from nvflare.client.config import ExchangeFormat
+from nvflare.fuel.utils.secret_utils import PotentialSecretWarning
+
+torch = pytest.importorskip("torch")
+
+
+@pytest.fixture
+def mock_file_system():
+    """Mock file system operations for all tests."""
+    with (
+        patch("os.path.isfile", return_value=True),
+        patch("os.path.isdir", return_value=True),
+        patch("os.path.exists", return_value=True),
+    ):
+        yield
+
+
+@pytest.fixture
+def simple_pt_model():
+    """Create a simple PyTorch model for testing."""
+    import torch.nn as nn
+
+    return nn.Linear(10, 2)
+
+
+class TestSwarmLearningRecipe:
+    """Test cases for SwarmLearningRecipe."""
+
+    def test_warns_on_secret_in_train_args(self, mock_file_system, simple_pt_model):
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        with pytest.warns(PotentialSecretWarning, match="train_args"):
+            SwarmLearningRecipe(
+                name="secret_swarm",
+                model=simple_pt_model,
+                num_rounds=1,
+                train_script="train.py",
+                min_clients=2,
+                train_args={"script_args": "--password hunter22x"},
+            )
+
+    def test_warns_on_secret_assignment_in_external_command(self, mock_file_system, simple_pt_model):
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        with pytest.warns(PotentialSecretWarning, match="command") as record:
+            SwarmLearningRecipe(
+                name="secret_command_swarm",
+                model=simple_pt_model,
+                num_rounds=1,
+                train_script="train.py",
+                min_clients=2,
+                launch_external_process=True,
+                command="env API_PASSWORD=hunter22x python3 -u",
+            )
+
+        assert all("hunter22x" not in str(warning.message) for warning in record)
+
+    def test_import_from_new_location(self, mock_file_system, simple_pt_model):
+        """Test importing from new location (app_opt/pt/recipes)."""
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        recipe = SwarmLearningRecipe(
+            name="test_swarm",
+            model=simple_pt_model,
+            num_rounds=5,
+            train_script="train.py",
+            min_clients=2,
+        )
+
+        assert recipe._job is not None
+
+    @pytest.mark.parametrize(
+        "key_metric,key_metric_mode,negate_key_metric",
+        [
+            ("accuracy", "max", False),
+            ("val_loss", "min", True),
+        ],
+    )
+    def test_configures_client_side_best_model_selection(
+        self,
+        mock_file_system,
+        simple_pt_model,
+        key_metric,
+        key_metric_mode,
+        negate_key_metric,
+    ):
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        recipe = SwarmLearningRecipe(
+            name="test_swarm_model_selection",
+            model=simple_pt_model,
+            num_rounds=5,
+            train_script="train.py",
+            min_clients=2,
+            key_metric=key_metric,
+            key_metric_mode=key_metric_mode,
+        )
+
+        client_components = recipe._job._deploy_map[ALL_SITES].app_config.components
+        selector = client_components["model_selector"]
+        persistor = client_components["persistor"]
+
+        assert isinstance(selector, IntimeModelSelector)
+        assert selector.key_metric == key_metric
+        assert selector.negate_key_metric is negate_key_metric
+        assert isinstance(persistor, PTFileModelPersistor)
+        assert persistor.best_global_model_file_name == DefaultCheckpointFileName.BEST_GLOBAL_MODEL
+        assert "model_selector" not in recipe._job._deploy_map[SERVER_SITE_NAME].app_config.components
+
+    def test_rejects_invalid_key_metric_mode(self, mock_file_system, simple_pt_model):
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        with pytest.raises(ValueError, match="key_metric_mode"):
+            SwarmLearningRecipe(
+                name="test_swarm_invalid_metric_mode",
+                model=simple_pt_model,
+                num_rounds=5,
+                train_script="train.py",
+                min_clients=2,
+                key_metric_mode="median",
+            )
+
+    @pytest.mark.parametrize("key_metric", ("", "   "))
+    def test_rejects_empty_key_metric(self, mock_file_system, simple_pt_model, key_metric):
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        with pytest.raises(ValueError, match="key_metric must be a non-empty string or None"):
+            SwarmLearningRecipe(
+                name="test_swarm_empty_metric",
+                model=simple_pt_model,
+                num_rounds=5,
+                train_script="train.py",
+                min_clients=2,
+                key_metric=key_metric,
+            )
+
+    def test_key_metric_none_disables_client_side_best_model_selection(self, mock_file_system, simple_pt_model):
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        recipe = SwarmLearningRecipe(
+            name="test_swarm_without_model_selection",
+            model=simple_pt_model,
+            num_rounds=5,
+            train_script="train.py",
+            min_clients=2,
+            key_metric=None,
+        )
+
+        client_components = recipe._job._deploy_map[ALL_SITES].app_config.components
+        assert "model_selector" not in client_components
+
+    def test_base_recipe_accepts_custom_model_selector(self, mock_file_system, simple_pt_model):
+        from nvflare.app_common.aggregators.intime_accumulate_model_aggregator import InTimeAccumulateWeightedAggregator
+        from nvflare.app_common.ccwf.ccwf_job import SwarmClientConfig, SwarmServerConfig
+        from nvflare.app_common.ccwf.comps.simple_model_shareable_generator import SimpleModelShareableGenerator
+        from nvflare.app_opt.pt.recipes.swarm import BaseSwarmLearningRecipe
+        from nvflare.job_config.script_runner import ScriptRunner
+
+        selector = IntimeModelSelector(key_metric="custom_score")
+        client_config = SwarmClientConfig(
+            executor=ScriptRunner(script="train.py"),
+            aggregator=InTimeAccumulateWeightedAggregator(),
+            persistor=PTFileModelPersistor(model=simple_pt_model),
+            shareable_generator=SimpleModelShareableGenerator(),
+            model_selector=selector,
+            min_responses_required=2,
+        )
+        recipe = BaseSwarmLearningRecipe(
+            name="test_custom_swarm_selector",
+            server_config=SwarmServerConfig(num_rounds=5, min_clients=2),
+            client_config=client_config,
+            min_clients=2,
+        )
+
+        client_components = recipe._job._deploy_map[ALL_SITES].app_config.components
+        assert client_components["model_selector"] is selector
+
+    def test_weight_diff_with_default_transfer_is_valid(self, mock_file_system, simple_pt_model):
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        recipe = SwarmLearningRecipe(
+            name="test_swarm_weight_diff",
+            model=simple_pt_model,
+            num_rounds=5,
+            train_script="train.py",
+            min_clients=2,
+            expected_data_kind=DataKind.WEIGHT_DIFF,
+        )
+
+        assert recipe._job is not None
+
+    def test_import_from_old_location_backward_compat(self, mock_file_system, simple_pt_model):
+        """Test importing from old location (backward compatibility)."""
+        from nvflare.app_common.ccwf.recipes.swarm import SwarmLearningRecipe
+
+        recipe = SwarmLearningRecipe(
+            name="test_swarm",
+            model=simple_pt_model,
+            num_rounds=5,
+            train_script="train.py",
+            min_clients=2,
+        )
+
+        assert recipe._job is not None
+
+    def test_initial_ckpt_accepted(self, mock_file_system, simple_pt_model):
+        """Test that initial_ckpt parameter is accepted."""
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        recipe = SwarmLearningRecipe(
+            name="test_swarm_ckpt",
+            model=simple_pt_model,
+            num_rounds=5,
+            train_script="train.py",
+            min_clients=2,
+            initial_ckpt="/abs/path/to/model.pt",
+        )
+
+        assert recipe._job is not None
+
+    def test_relative_path_accepted_if_exists(self, mock_file_system, simple_pt_model):
+        """Test that existing relative paths are accepted and bundled."""
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        # This should not raise since relative paths are now supported
+        recipe = SwarmLearningRecipe(
+            name="test_swarm",
+            model=simple_pt_model,
+            num_rounds=5,
+            train_script="train.py",
+            min_clients=2,
+            initial_ckpt="relative/path/model.pt",
+        )
+        assert recipe is not None
+
+    def test_cross_site_eval_option(self, mock_file_system, simple_pt_model):
+        """Test with cross-site evaluation enabled."""
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        recipe = SwarmLearningRecipe(
+            name="test_swarm_cse",
+            model=simple_pt_model,
+            num_rounds=5,
+            train_script="train.py",
+            min_clients=2,
+            do_cross_site_eval=True,
+            cross_site_eval_timeout=600,
+        )
+
+        assert recipe._job is not None
+
+    def test_dict_model_config_accepted(self, mock_file_system):
+        """Test that dict model config is accepted."""
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        recipe = SwarmLearningRecipe(
+            name="test_swarm_dict",
+            model={"class_path": "torch.nn.Linear", "args": {"in_features": 10, "out_features": 2}},
+            num_rounds=5,
+            train_script="train.py",
+            min_clients=2,
+        )
+
+        assert recipe._job is not None
+
+    def test_dict_model_config_with_ckpt(self, mock_file_system):
+        """Test dict model config with initial checkpoint."""
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        recipe = SwarmLearningRecipe(
+            name="test_swarm_dict_ckpt",
+            model={"class_path": "torch.nn.Linear", "args": {"in_features": 10, "out_features": 2}},
+            num_rounds=5,
+            train_script="train.py",
+            min_clients=2,
+            initial_ckpt="/abs/path/to/model.pt",
+        )
+
+        assert recipe._job is not None
+
+    def test_dict_model_missing_class_path_or_path_rejected(self, mock_file_system):
+        """Test that dict model without 'class_path' or 'path' key is rejected."""
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        with pytest.raises(ValueError, match="must have 'class_path' or 'path' key"):
+            SwarmLearningRecipe(
+                name="test_swarm_bad_dict",
+                model={"args": {"in_features": 10}},  # Missing 'class_path'/'path'
+                num_rounds=5,
+                train_script="train.py",
+                min_clients=2,
+            )
+
+    def test_train_args_reserved_keys_rejected(self, mock_file_system, simple_pt_model):
+        """Test that train_args with reserved keys are rejected."""
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        with pytest.raises(ValueError, match="reserved keys"):
+            SwarmLearningRecipe(
+                name="test_swarm_bad_args",
+                model=simple_pt_model,
+                num_rounds=5,
+                train_script="train.py",
+                min_clients=2,
+                train_args={"script": "other.py"},  # 'script' is reserved
+            )
+
+    def test_train_args_valid_keys_accepted(self, mock_file_system, simple_pt_model):
+        """Test that valid train_args are accepted."""
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        recipe = SwarmLearningRecipe(
+            name="test_swarm_args",
+            model=simple_pt_model,
+            num_rounds=5,
+            train_script="train.py",
+            min_clients=2,
+            train_args={"script_args": "--batch_size 32"},  # valid key
+        )
+
+        assert recipe._job is not None
+
+    def test_min_clients_accepted(self, mock_file_system, simple_pt_model):
+        """Test that min_clients is a required parameter and is passed to the job."""
+        import inspect
+
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        sig = inspect.signature(SwarmLearningRecipe.__init__)
+        assert "min_clients" in sig.parameters
+        assert sig.parameters["min_clients"].default is inspect.Parameter.empty  # required, no default
+
+        recipe = SwarmLearningRecipe(
+            name="test_swarm_min_clients",
+            model=simple_pt_model,
+            num_rounds=5,
+            train_script="train.py",
+            min_clients=3,
+        )
+
+        assert recipe._job is not None
+
+    def test_launch_external_process_accepted(self, mock_file_system, simple_pt_model):
+        """Test that launch_external_process=True is accepted."""
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        recipe = SwarmLearningRecipe(
+            name="test_swarm_ext",
+            model=simple_pt_model,
+            num_rounds=5,
+            train_script="train.py",
+            min_clients=2,
+            launch_external_process=True,
+        )
+
+        assert recipe._job is not None
+
+    def test_command_accepted(self, mock_file_system, simple_pt_model):
+        """Test that command is accepted alongside launch_external_process."""
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        recipe = SwarmLearningRecipe(
+            name="test_swarm_cmd",
+            model=simple_pt_model,
+            num_rounds=5,
+            train_script="train.py",
+            min_clients=2,
+            launch_external_process=True,
+            command="python3 -u",
+        )
+
+        assert recipe._job is not None
+
+    def test_pre_tokenized_command_is_validated_and_copied(self, mock_file_system, simple_pt_model):
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        command = ["python3", "-u"]
+        recipe = SwarmLearningRecipe(
+            name="test_swarm_argv_cmd",
+            model=simple_pt_model,
+            num_rounds=1,
+            train_script="train.py",
+            min_clients=2,
+            launch_external_process=True,
+            command=command,
+        )
+        command[-1] = "mutated"
+
+        client_app = recipe._job._deploy_map[ALL_SITES]
+        train_executor = next(item.executor for item in client_app.app_config.executors if "train" in item.tasks)
+        assert train_executor._command[:2] == ["python3", "-u"]
+
+        with pytest.raises(ValueError, match="command must be a string or list of strings"):
+            SwarmLearningRecipe(
+                name="test_swarm_invalid_argv_cmd",
+                model=simple_pt_model,
+                num_rounds=1,
+                train_script="train.py",
+                min_clients=2,
+                command=("python3", "-u"),
+            )
+
+
+class TestSwarmLearningRecipeControllerConfig:
+    """Test named controller parameters and advanced config overrides."""
+
+    def test_parameters_and_override_precedence(self, mock_file_system, simple_pt_model):
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        recipe = SwarmLearningRecipe(
+            name="test_swarm_override_precedence",
+            model=simple_pt_model,
+            num_rounds=5,
+            train_script="train.py",
+            min_clients=2,
+            progress_timeout=7200,
+            learn_task_timeout=1800,
+            max_concurrent_submissions=3,
+            learn_task_abort_timeout=15,
+            learn_task_ack_timeout=20,
+            final_result_ack_timeout=25,
+            server_config_overrides={"progress_timeout": 9000},
+            client_config_overrides={
+                "learn_task_timeout": 2400,
+                "max_concurrent_submissions": 4,
+                "final_result_ack_timeout": 30,
+            },
+        )
+
+        server_controller = recipe._job._deploy_map["server"].app_config.workflows[0].controller
+        client_app = recipe._job._deploy_map[ALL_SITES]
+        client_controller = next(item.executor for item in client_app.app_config.executors if item.tasks == ["swarm_*"])
+        assert server_controller.progress_timeout == 9000
+        assert client_controller.learn_task_timeout == 2400
+        assert client_controller.max_concurrent_submissions == 4
+        assert client_controller.learn_task_abort_timeout == 15
+        assert client_controller.learn_task_ack_timeout == 20
+        assert client_controller.final_result_ack_timeout == 30
+
+    def test_invalid_new_config_is_rejected(self, mock_file_system, simple_pt_model):
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        defaults = {
+            "name": "test_swarm_invalid_overrides",
+            "model": simple_pt_model,
+            "num_rounds": 5,
+            "train_script": "train.py",
+            "min_clients": 2,
+        }
+        with pytest.raises(ValueError, match="learn_task_timeout"):
+            SwarmLearningRecipe(**defaults, learn_task_timeout=0)
+        with pytest.raises(ValueError, match="learn_task_abort_timeout"):
+            SwarmLearningRecipe(**defaults, learn_task_abort_timeout=0)
+        for invalid_max_concurrency in (
+            {"max_concurrent_submissions": 0},
+            {"client_config_overrides": {"max_concurrent_submissions": 0}},
+        ):
+            with pytest.raises(ValueError, match="max_concurrent_submissions"):
+                SwarmLearningRecipe(**defaults, **invalid_max_concurrency)
+        with pytest.raises(ValueError, match="cannot override recipe-managed fields: executor"):
+            SwarmLearningRecipe(**defaults, client_config_overrides={"executor": object()})
+        with pytest.raises(ValueError, match="cannot override recipe-managed fields: min_responses_required"):
+            SwarmLearningRecipe(**defaults, client_config_overrides={"min_responses_required": 5})
+        with pytest.raises(ValueError, match="cannot override recipe-managed fields: model_selector"):
+            SwarmLearningRecipe(**defaults, client_config_overrides={"model_selector": None})
+        with pytest.raises(TypeError, match="server_config_overrides must be a dict"):
+            SwarmLearningRecipe(**defaults, server_config_overrides=[])
+        with pytest.raises(TypeError, match="server_config_overrides keys must be strings"):
+            SwarmLearningRecipe(**defaults, server_config_overrides={1: 2})
+        with pytest.raises(ValueError, match="cannot override recipe-managed fields: min_clients"):
+            SwarmLearningRecipe(**defaults, server_config_overrides={"min_clients": 5})
+
+
+class TestSwarmLearningRecipeMemoryGC:
+    """Test memory GC parameters on SwarmLearningRecipe."""
+
+    def test_default_memory_gc_rounds_is_one(self):
+        """Default memory_gc_rounds=1 for backward compatibility with legacy GC behavior."""
+        import inspect
+
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        sig = inspect.signature(SwarmLearningRecipe.__init__)
+        assert sig.parameters["memory_gc_rounds"].default == 1
+
+    def test_old_param_name_rejected(self, mock_file_system, simple_pt_model):
+        """client_memory_gc_rounds (old name) is no longer accepted."""
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        with pytest.raises(TypeError, match="client_memory_gc_rounds"):
+            SwarmLearningRecipe(
+                name="test_swarm",
+                model=simple_pt_model,
+                num_rounds=5,
+                train_script="train.py",
+                client_memory_gc_rounds=2,
+            )
+
+    def test_memory_gc_rounds_custom_accepted(self, mock_file_system, simple_pt_model):
+        """Custom memory_gc_rounds is accepted."""
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        recipe = SwarmLearningRecipe(
+            name="test_swarm",
+            model=simple_pt_model,
+            num_rounds=5,
+            train_script="train.py",
+            min_clients=2,
+            memory_gc_rounds=2,
+        )
+        assert recipe._job is not None
+
+    def test_memory_gc_disabled_accepted(self, mock_file_system, simple_pt_model):
+        """memory_gc_rounds=0 disables GC."""
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        recipe = SwarmLearningRecipe(
+            name="test_swarm",
+            model=simple_pt_model,
+            num_rounds=5,
+            train_script="train.py",
+            min_clients=2,
+            memory_gc_rounds=0,
+        )
+        assert recipe._job is not None
+
+    def test_cuda_empty_cache_accepted(self, mock_file_system, simple_pt_model):
+        """cuda_empty_cache=True is accepted and wired through."""
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        recipe = SwarmLearningRecipe(
+            name="test_swarm",
+            model=simple_pt_model,
+            num_rounds=5,
+            train_script="train.py",
+            min_clients=2,
+            cuda_empty_cache=True,
+        )
+        assert recipe._job is not None
+
+
+class TestSwarmLearningRecipeTensorDiskOffload:
+    """Test PyTorch streaming and aggregation-client disk offload wiring."""
+
+    @staticmethod
+    def _get_client_components(recipe):
+        client_app = recipe._job._deploy_map[ALL_SITES]
+        client_controller = next(item.executor for item in client_app.app_config.executors if item.tasks == ["swarm_*"])
+        train_executor = next(item.executor for item in client_app.app_config.executors if "train" in item.tasks)
+        persistor = client_app.app_config.components["persistor"]
+        return client_controller, train_executor, persistor
+
+    def test_pytorch_streaming_with_disk_offload_is_wired_to_aggregation_controller(
+        self, mock_file_system, simple_pt_model
+    ):
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        recipe = SwarmLearningRecipe(
+            name="test_swarm_tensor_disk_offload",
+            model=simple_pt_model,
+            num_rounds=1,
+            train_script="train.py",
+            min_clients=2,
+            aggregation_format=ExchangeFormat.PYTORCH,
+            enable_tensor_disk_offload=True,
+        )
+
+        client_controller, train_executor, persistor = self._get_client_components(recipe)
+        assert recipe.aggregation_format == ExchangeFormat.PYTORCH
+        assert recipe.enable_tensor_disk_offload is True
+        assert client_controller.enable_tensor_disk_offload is True
+        assert train_executor._server_expected_format == ExchangeFormat.PYTORCH
+        assert persistor._allow_numpy_conversion is False
+
+    def test_string_aggregation_format_is_normalized(self, mock_file_system, simple_pt_model):
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        recipe = SwarmLearningRecipe(
+            name="test_swarm_string_exchange_format",
+            model=simple_pt_model,
+            num_rounds=1,
+            train_script="train.py",
+            min_clients=2,
+            aggregation_format="pytorch",
+            enable_tensor_disk_offload=True,
+        )
+
+        client_controller, train_executor, persistor = self._get_client_components(recipe)
+        assert recipe.aggregation_format == ExchangeFormat.PYTORCH
+        assert client_controller.enable_tensor_disk_offload is True
+        assert train_executor._server_expected_format == ExchangeFormat.PYTORCH
+        assert persistor._allow_numpy_conversion is False
+
+    def test_invalid_aggregation_format_is_rejected(self, mock_file_system, simple_pt_model):
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        with pytest.raises(ValueError, match="invalid aggregation_format"):
+            SwarmLearningRecipe(
+                name="test_swarm_invalid_exchange_format",
+                model=simple_pt_model,
+                num_rounds=1,
+                train_script="train.py",
+                min_clients=2,
+                aggregation_format="pt",
+            )
+
+    def test_non_boolean_disk_offload_override_is_rejected(self, mock_file_system, simple_pt_model):
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        with pytest.raises(TypeError, match="enable_tensor_disk_offload"):
+            SwarmLearningRecipe(
+                name="test_swarm_invalid_disk_offload_override",
+                model=simple_pt_model,
+                num_rounds=1,
+                train_script="train.py",
+                min_clients=2,
+                client_config_overrides={"enable_tensor_disk_offload": "yes"},
+            )
+
+    def test_disk_offload_warns_when_payloads_are_numpy(self, mock_file_system, simple_pt_model):
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        with pytest.warns(UserWarning, match="only applies to streamed PyTorch tensors"):
+            SwarmLearningRecipe(
+                name="test_swarm_tensor_disk_offload_warning",
+                model=simple_pt_model,
+                num_rounds=1,
+                train_script="train.py",
+                min_clients=2,
+                enable_tensor_disk_offload=True,
+            )
+
+
+class TestSwarmLearningRecipeExport:
+    """Export behavior tests for SwarmLearningRecipe."""
+
+    def test_export_includes_client_side_best_model_selector(self, tmp_path):
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        train_script = tmp_path / "train.py"
+        train_script.write_text("print('train')\n")
+        recipe = SwarmLearningRecipe(
+            name="swarm_best_model",
+            model={"class_path": "torch.nn.Linear", "args": {"in_features": 2, "out_features": 2}},
+            num_rounds=2,
+            train_script=str(train_script),
+            min_clients=2,
+            key_metric="val_loss",
+            key_metric_mode="min",
+        )
+
+        export_dir = tmp_path / "job"
+        recipe.export(str(export_dir))
+
+        client_config_path = export_dir / "swarm_best_model" / "app" / "config" / "config_fed_client.json"
+        with open(client_config_path, "r") as f:
+            client_config = json.load(f)
+        selector = next(component for component in client_config["components"] if component["id"] == "model_selector")
+
+        assert selector["path"].endswith(".IntimeModelSelector")
+        assert selector["args"]["key_metric"] == "val_loss"
+        assert selector["args"]["negate_key_metric"] is True
+
+    def test_export_omits_client_side_best_model_selector_when_disabled(self, tmp_path):
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        train_script = tmp_path / "train.py"
+        train_script.write_text("print('train')\n")
+        recipe = SwarmLearningRecipe(
+            name="swarm_without_best_model",
+            model={"class_path": "torch.nn.Linear", "args": {"in_features": 2, "out_features": 2}},
+            num_rounds=2,
+            train_script=str(train_script),
+            min_clients=2,
+            key_metric=None,
+        )
+
+        export_dir = tmp_path / "job"
+        recipe.export(str(export_dir))
+
+        client_config_path = export_dir / "swarm_without_best_model" / "app" / "config" / "config_fed_client.json"
+        with open(client_config_path, "r") as f:
+            client_config = json.load(f)
+
+        assert all(component["id"] != "model_selector" for component in client_config["components"])
+
+    def test_export_nested_relative_ckpt_uses_configured_basename(self, tmp_path, monkeypatch):
+        """A nested relative checkpoint is flattened into each client app."""
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        checkpoint = tmp_path / "models" / "checkpoint.pt"
+        checkpoint.parent.mkdir()
+        checkpoint.write_bytes(b"checkpoint")
+        train_script = tmp_path / "train.py"
+        train_script.write_text("print('train')\n")
+        monkeypatch.chdir(tmp_path)
+
+        job_name = "swarm_nested_ckpt"
+        recipe = SwarmLearningRecipe(
+            name=job_name,
+            model={"class_path": "torch.nn.Linear", "args": {"in_features": 2, "out_features": 2}},
+            num_rounds=1,
+            train_script="train.py",
+            min_clients=2,
+            initial_ckpt="models/checkpoint.pt",
+        )
+
+        checkpoint_source = ("models/checkpoint.pt", None, None)
+        assert checkpoint_source in recipe._job._deploy_map[ALL_SITES].app_config.file_sources
+        assert checkpoint_source not in recipe._job._deploy_map[SERVER_SITE_NAME].app_config.file_sources
+
+        export_dir = tmp_path / "job"
+        recipe.export(str(export_dir))
+
+        custom_dir = export_dir / job_name / "app" / "custom"
+        assert (custom_dir / "checkpoint.pt").is_file()
+        assert not (custom_dir / "models" / "checkpoint.pt").exists()
+
+        config_path = export_dir / job_name / "app" / "config" / "config_fed_client.json"
+        with open(config_path, "r") as f:
+            config = json.load(f)
+        persistor = next(component for component in config["components"] if component["id"] == "persistor")
+        assert persistor["args"]["source_ckpt_file_full_name"] == "checkpoint.pt"
+
+    def test_export_preserves_dict_model_args_in_client_config(self, tmp_path):
+        """Regression: exported client config keeps dict model args for PTFileModelPersistor."""
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        train_script = tmp_path / "driver.py"
+        train_script.write_text("print('train')\n")
+
+        model_name_or_path = "meta-llama/Llama-3.1-8B"
+        model = {
+            "class_path": "hf_sft_model.CausalLMModel",
+            "args": {"model_name_or_path": model_name_or_path},
+        }
+        job_name = "swarm_issue_reproducer"
+
+        recipe = SwarmLearningRecipe(
+            name=job_name,
+            model=model,
+            num_rounds=3,
+            train_script=str(train_script),
+            min_clients=2,
+        )
+
+        export_dir = tmp_path / "job"
+        recipe.export(str(export_dir))
+
+        config_path = export_dir / job_name / "app" / "config" / "config_fed_client.json"
+        with open(config_path, "r") as f:
+            config = json.load(f)
+
+        persistor = None
+        for comp in config.get("components", []):
+            if comp.get("id") == "persistor":
+                persistor = comp
+                break
+
+        assert persistor is not None, "Persistor component not found in client config"
+        model_cfg = persistor.get("args", {}).get("model")
+        assert model_cfg is not None, "Persistor model config is missing"
+        assert model_cfg.get("path") == "hf_sft_model.CausalLMModel"
+        assert model_cfg.get("args", {}).get("model_name_or_path") == model_name_or_path
+
+    def test_export_default_transport_uses_client_api_executor(self, tmp_path):
+        """Default transport uses ClientAPIExecutor directly without legacy pipe components."""
+        import torch.nn as nn
+
+        from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+
+        train_script = tmp_path / "train.py"
+        train_script.write_text("print('train')\n")
+
+        recipe = SwarmLearningRecipe(
+            name="test_external_process_export",
+            model=nn.Linear(2, 2),
+            num_rounds=1,
+            train_script=str(train_script),
+            min_clients=2,
+            launch_external_process=True,
+        )
+
+        export_dir = tmp_path / "job"
+        recipe.export(str(export_dir))
+
+        config_path = export_dir / "test_external_process_export" / "app" / "config" / "config_fed_client.json"
+        with open(config_path, "r") as f:
+            config = json.load(f)
+
+        train_executor = next(entry["executor"] for entry in config["executors"] if "train" in entry.get("tasks", []))
+        assert train_executor["path"].endswith(".ClientAPIExecutor")
+        assert train_executor["args"]["execution_mode"] == "external_process"
+        component_ids = {component["id"] for component in config.get("components", [])}
+        assert "pipe" not in component_ids
+        assert "launcher" not in component_ids

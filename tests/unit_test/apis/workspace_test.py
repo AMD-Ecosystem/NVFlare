@@ -1,0 +1,118 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import os
+import tempfile
+
+import pytest
+
+from nvflare.apis.fl_constant import WorkspaceConstants
+from nvflare.apis.workspace import Workspace
+
+
+class TestWorkspace:
+    @staticmethod
+    def _make_workspace(root_dir: str):
+        os.makedirs(os.path.join(root_dir, "startup"), exist_ok=True)
+        os.makedirs(os.path.join(root_dir, "local"), exist_ok=True)
+        return Workspace(root_dir)
+
+    @pytest.mark.parametrize(
+        "root_vars, expected",
+        [
+            (("r", "l", "a"), ("r", "l", "a")),
+            (("r", "l", None), ("r", "l", "l")),
+            (("r", None, None), ("r", "r", "r")),
+            (("r", None, "a"), ("r", "a", "a")),
+            ((None, "l", "a"), (None, "l", "a")),
+            ((None, "l", None), (None, "l", "l")),
+            ((None, None, None), (None, None, None)),
+        ],
+    )
+    def test_init(self, root_vars, expected):
+        # we have to create real dirs since Workspace checks existence of the specified roots
+        r, l, a = root_vars
+        var_dict = {
+            WorkspaceConstants.ENV_VAR_RESULT_ROOT: r,
+            WorkspaceConstants.ENV_VAR_LOG_ROOT: l,
+            WorkspaceConstants.ENV_VAR_AUDIT_ROOT: a,
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            for n, v in var_dict.items():
+                if v:
+                    os.environ[n] = os.path.join(tmp_dir, v)
+                else:
+                    os.environ.pop(n, None)
+
+            root_dir = os.path.join(tmp_dir, "config")
+            os.makedirs(root_dir, exist_ok=True)
+            os.makedirs(os.path.join(root_dir, "startup"), exist_ok=True)
+            os.makedirs(os.path.join(root_dir, "local"), exist_ok=True)
+
+            ws = Workspace(root_dir)
+            result = (
+                os.path.relpath(ws.result_root, tmp_dir) if ws.result_root else None,
+                os.path.relpath(ws.log_root, tmp_dir) if ws.log_root else None,
+                os.path.relpath(ws.audit_root, tmp_dir) if ws.audit_root else None,
+            )
+
+            # clean up env vars after testing
+            for n in var_dict.keys():
+                os.environ.pop(n, None)
+
+            assert result == expected
+
+    def test_study_registry_path_defaults_to_root_when_absent(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ws = self._make_workspace(tmp_dir)
+            expected = os.path.join(tmp_dir, WorkspaceConstants.STUDY_REGISTRY_CONFIG)
+            assert ws.get_study_registry_file_path() == expected
+
+    def test_study_registry_path_falls_back_to_site_config_seed(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ws = self._make_workspace(tmp_dir)
+            seed = os.path.join(tmp_dir, "local", WorkspaceConstants.STUDY_REGISTRY_CONFIG)
+            with open(seed, "wt") as f:
+                f.write("{}")
+            assert ws.get_study_registry_file_path() == seed
+
+    def test_study_registry_path_prefers_root_copy_over_seed(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ws = self._make_workspace(tmp_dir)
+            seed = os.path.join(tmp_dir, "local", WorkspaceConstants.STUDY_REGISTRY_CONFIG)
+            root_copy = os.path.join(tmp_dir, WorkspaceConstants.STUDY_REGISTRY_CONFIG)
+            for path in (seed, root_copy):
+                with open(path, "wt") as f:
+                    f.write("{}")
+            assert ws.get_study_registry_file_path() == root_copy
+
+    @pytest.mark.parametrize(
+        "job_id",
+        [
+            "../outside",
+            "good/../../outside",
+            "/tmp/outside",
+            "bad\\id",
+            "",
+            None,
+        ],
+    )
+    def test_get_run_dir_rejects_unsafe_job_id(self, job_id):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root_dir = os.path.join(tmp_dir, "config")
+            ws = self._make_workspace(root_dir)
+
+            with pytest.raises(ValueError):
+                ws.get_run_dir(job_id)
+
+            assert not os.path.exists(os.path.join(tmp_dir, "outside"))

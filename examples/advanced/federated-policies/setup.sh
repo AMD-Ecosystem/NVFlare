@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+cd $DIR
+rm -rf workspace
+nvflare provision -p project.yml
+WORKSPACE="${DIR}/workspace/fed_policy/prod_00"
+cp -r policies/site_a/* $WORKSPACE/site_a/local
+cp -r policies/site_b/* $WORKSPACE/site_b/local
+
+echo Your workspace is "$WORKSPACE"
+

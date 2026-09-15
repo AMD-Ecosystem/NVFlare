@@ -1,0 +1,203 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+import tempfile
+from importlib.metadata import PackageNotFoundError
+from unittest.mock import patch
+
+import pytest
+
+from nvflare.app_opt.flower.recipe import FlowerRecipe
+from nvflare.fuel.utils.secret_utils import PotentialSecretWarning, UnsupportedSecretRefWarning
+from nvflare.job_config.api import FedJob
+from nvflare.recipe import secret_ref
+
+
+@pytest.mark.parametrize("flwr_version", ["1.15.9", "1.16rc0", "1.25.9", "1.26.0rc0"])
+def test_flower_recipe_rejects_incompatible_flwr_version(flwr_version):
+    with patch("nvflare.app_opt.flower.recipe.get_package_version", return_value=flwr_version):
+        with patch("nvflare.app_opt.flower.recipe._create_flower_job") as mock_flower_job:
+            with pytest.raises(RuntimeError, match=r"requires 'flwr>=1\.26'"):
+                FlowerRecipe(flower_content="mock_flower_content")
+
+            mock_flower_job.assert_not_called()
+
+
+def test_flower_recipe_rejects_missing_flwr_package():
+    with patch("nvflare.app_opt.flower.recipe.get_package_version", side_effect=PackageNotFoundError):
+        with patch("nvflare.app_opt.flower.recipe._create_flower_job") as mock_flower_job:
+            with pytest.raises(RuntimeError, match=r"requires 'flwr>=1\.26'"):
+                FlowerRecipe(flower_content="mock_flower_content")
+
+            mock_flower_job.assert_not_called()
+
+
+@pytest.mark.parametrize("flwr_version", ["1.26.0", "1.26.1", "1.27.5"])
+def test_flower_recipe_accepts_compatible_flwr_version(flwr_version):
+    fake_job = FedJob(name="test_flower", min_clients=1)
+    with patch("nvflare.app_opt.flower.recipe.get_package_version", return_value=flwr_version):
+        with patch("nvflare.app_opt.flower.recipe._create_flower_job", return_value=fake_job) as mock_flower_job:
+            recipe = FlowerRecipe(flower_content="mock_flower_content")
+
+    assert recipe._job is fake_job
+    kwargs = mock_flower_job.call_args.kwargs
+    assert kwargs["extra_env"] is None
+
+
+def test_flower_recipe_forwards_run_config():
+    fake_job = FedJob(name="test_flower", min_clients=1)
+    run_config = {"learning-rate": 0.01, "momentum": 0.9}
+
+    with patch("nvflare.app_opt.flower.recipe.get_package_version", return_value="1.26.0"):
+        with patch("nvflare.app_opt.flower.recipe._create_flower_job", return_value=fake_job) as mock_flower_job:
+            recipe = FlowerRecipe(flower_content="mock_flower_content", run_config=run_config)
+
+    assert recipe._job is fake_job
+    kwargs = mock_flower_job.call_args.kwargs
+    assert kwargs["run_config"] == run_config
+
+
+@pytest.mark.parametrize(
+    "parameter, value",
+    [
+        ("extra_env", {"API_TOKEN": "abcd1234efgh"}),
+        ("run_config", {"password": "hunter22x"}),
+    ],
+)
+def test_flower_recipe_warns_on_secret_parameters(parameter, value):
+    fake_job = FedJob(name="test_flower", min_clients=1)
+
+    with patch("nvflare.app_opt.flower.recipe.get_package_version", return_value="1.26.0"):
+        with patch("nvflare.app_opt.flower.recipe._create_flower_job", return_value=fake_job):
+            with pytest.warns(PotentialSecretWarning, match=parameter):
+                FlowerRecipe(flower_content="mock_flower_content", **{parameter: value})
+
+
+@pytest.mark.parametrize("parameter", ["extra_env", "run_config"])
+def test_flower_recipe_warns_on_unsupported_secret_refs(parameter):
+    fake_job = FedJob(name="test_flower", min_clients=1)
+    value = {"api_token": secret_ref("API_TOKEN")}
+
+    with patch("nvflare.app_opt.flower.recipe.get_package_version", return_value="1.26.0"):
+        with patch("nvflare.app_opt.flower.recipe._create_flower_job", return_value=fake_job):
+            with pytest.warns(UnsupportedSecretRefWarning, match=parameter):
+                FlowerRecipe(flower_content="mock_flower_content", **{parameter: value})
+
+
+@pytest.mark.parametrize("flwr_version", ["1.26.0", "1.26.1", "1.27.5"])
+def test_flower_recipe_forwards_extra_env_without_client_api_selector(flwr_version):
+    fake_job = FedJob(name="test_flower", min_clients=1)
+    user_env = {"MY_VAR": "123"}
+
+    with patch("nvflare.app_opt.flower.recipe.get_package_version", return_value=flwr_version):
+        with patch("nvflare.app_opt.flower.recipe._create_flower_job", return_value=fake_job) as mock_flower_job:
+            recipe = FlowerRecipe(flower_content="mock_flower_content", extra_env=user_env)
+
+    assert recipe._job is fake_job
+    kwargs = mock_flower_job.call_args.kwargs
+    assert kwargs["extra_env"] == user_env
+
+
+@pytest.mark.parametrize("flwr_version", ["1.26.0", "1.26.1", "1.27.5"])
+def test_flower_recipe_does_not_treat_client_api_type_as_metrics_selector(flwr_version):
+    user_env = {"CLIENT_API_TYPE": "caller-owned-value", "MY_VAR": "123"}
+
+    with patch("nvflare.app_opt.flower.recipe.get_package_version", return_value=flwr_version):
+        with patch("nvflare.app_opt.flower.recipe._create_flower_job", return_value=FedJob("test")) as mock_flower_job:
+            FlowerRecipe(flower_content="mock_flower_content", extra_env=user_env)
+
+    assert mock_flower_job.call_args.kwargs["extra_env"] == user_env
+
+
+@pytest.mark.parametrize("flwr_version", ["1.26.0", "1.26.1", "1.27.5"])
+def test_flower_recipe_with_predeployed_path(flwr_version):
+    fake_job = FedJob(name="test_flower", min_clients=1)
+    with patch("nvflare.app_opt.flower.recipe.get_package_version", return_value=flwr_version):
+        with patch("nvflare.app_opt.flower.recipe._create_flower_job", return_value=fake_job) as mock_flower_job:
+            recipe = FlowerRecipe(flower_app_path="/opt/flower_apps/my_app")
+
+    assert recipe._job is fake_job
+    kwargs = mock_flower_job.call_args.kwargs
+    assert kwargs["flower_app_path"] == "/opt/flower_apps/my_app"
+    assert kwargs["flower_content"] is None
+
+
+def test_flower_recipe_rejects_both_content_and_path():
+    with patch("nvflare.app_opt.flower.recipe.get_package_version", return_value="1.26.0"):
+        with patch(
+            "nvflare.app_opt.flower.recipe._create_flower_job",
+            side_effect=ValueError("Specify either 'flower_content'"),
+        ):
+            with pytest.raises(ValueError, match="Specify either 'flower_content'"):
+                FlowerRecipe(flower_content="mock_flower_content", flower_app_path="/opt/flower_apps/my_app")
+
+
+def test_flower_recipe_rejects_neither_content_nor_path():
+    with patch("nvflare.app_opt.flower.recipe.get_package_version", return_value="1.26.0"):
+        with patch(
+            "nvflare.app_opt.flower.recipe._create_flower_job",
+            side_effect=ValueError("One of 'flower_content' or 'flower_app_path' must be provided"),
+        ):
+            with pytest.raises(ValueError, match="One of 'flower_content' or 'flower_app_path' must be provided"):
+                FlowerRecipe()
+
+
+def test_flower_job_no_byoc_when_predeployed():
+    """Verify that a FlowerJob with flower_app_path exports without any custom/ content (no BYOC)."""
+    from nvflare.app_opt.flower.flower_job import FlowerJob
+
+    with tempfile.TemporaryDirectory() as job_root:
+        job = FlowerJob(
+            name="test_no_byoc_job",
+            flower_app_path="local/custom/flwr_pt_tb",
+            min_clients=1,
+        )
+        job.export_job(job_root)
+
+        job_dir = os.path.join(job_root, "test_no_byoc_job")
+        assert os.path.isdir(job_dir), "Job directory was not created"
+
+        for app_name in os.listdir(job_dir):
+            custom_dir = os.path.join(job_dir, app_name, "custom")
+            if os.path.isdir(custom_dir):
+                custom_contents = os.listdir(custom_dir)
+                assert len(custom_contents) == 0, f"Expected empty custom/ in {app_name}, but found: {custom_contents}"
+
+
+def test_flower_job_has_byoc_when_content_provided():
+    """Verify that a FlowerJob with flower_content exports with custom/ content (BYOC mode)."""
+    from nvflare.app_opt.flower.flower_job import FlowerJob
+
+    with tempfile.TemporaryDirectory() as app_dir:
+        test_file = os.path.join(app_dir, "pyproject.toml")
+        with open(test_file, "w") as f:
+            f.write("[tool.poetry]\nname = 'test'\n")
+
+        with tempfile.TemporaryDirectory() as job_root:
+            job = FlowerJob(
+                name="test_byoc_job",
+                flower_content=app_dir,
+                min_clients=1,
+            )
+            job.export_job(job_root)
+
+            job_dir = os.path.join(job_root, "test_byoc_job")
+            assert os.path.isdir(job_dir), "Job directory was not created"
+
+            server_custom = os.path.join(job_dir, "app", "custom")
+            assert os.path.isdir(server_custom), "Server custom/ directory was not created"
+            assert "pyproject.toml" in os.listdir(
+                server_custom
+            ), "Expected pyproject.toml in server custom/ for BYOC mode"

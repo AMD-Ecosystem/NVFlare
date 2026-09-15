@@ -1,0 +1,652 @@
+# Copyright (c) 2021, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import datetime
+import ipaddress
+import json
+import os
+import secrets
+import shutil
+import string
+from base64 import b64decode, b64encode
+from pathlib import Path
+
+import yaml
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import dsa, ec, ed448, ed25519, padding, rsa
+from cryptography.x509.oid import ExtensionOID, NameOID
+from cryptography.x509.verification import ExtensionPolicy, PolicyBuilder, Store
+
+from nvflare.fuel.sec.admin_cert import validate_admin_leaf_cert
+from nvflare.lighter.tool_consts import NVFLARE_SIG_FILE, NVFLARE_SUBMITTER_CRT_FILE
+
+_GENERATE_CERT_RESERVED_EXTENSION_OIDS = {
+    ExtensionOID.SUBJECT_KEY_IDENTIFIER,
+    ExtensionOID.AUTHORITY_KEY_IDENTIFIER,
+    ExtensionOID.SUBJECT_ALTERNATIVE_NAME,
+}
+
+
+class Identity:
+    def __init__(self, name: str, org: str = None, role: str = None):
+        self.name = name
+        self.org = org
+        self.role = role
+
+
+def _host_to_subject_alt_name(host: str):
+    try:
+        return x509.IPAddress(ipaddress.ip_address(host))
+    except ValueError:
+        return x509.DNSName(host)
+
+
+def build_subject_alt_names(server_default_host=None, server_additional_hosts=None, fallback_subject_name=None):
+    if isinstance(server_additional_hosts, str):
+        server_additional_hosts = [server_additional_hosts]
+
+    if server_default_host:
+        sans = [_host_to_subject_alt_name(server_default_host)]
+        if server_additional_hosts:
+            for h in server_additional_hosts:
+                if h != server_default_host:
+                    sans.append(_host_to_subject_alt_name(h))
+        return sans
+
+    if not fallback_subject_name:
+        raise ValueError("fallback_subject_name is required when server_default_host is not set")
+    return [x509.DNSName(fallback_subject_name)]
+
+
+def generate_cert(
+    subject: Identity,
+    issuer: Identity,
+    signing_pri_key,
+    subject_pub_key,
+    valid_days=360,
+    ca=False,
+    server_default_host=None,
+    server_additional_hosts=None,
+    not_valid_before=None,
+    not_valid_after=None,
+    extra_extensions=None,
+):
+    now = not_valid_before or datetime.datetime.now(datetime.timezone.utc)
+    cert_not_valid_after = not_valid_after or now + datetime.timedelta(days=valid_days)
+
+    x509_subject = x509_name(subject.name, subject.org, subject.role)
+    x509_issuer = x509_name(issuer.name, issuer.org, issuer.role)
+
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(x509_subject)
+        .issuer_name(x509_issuer)
+        .public_key(subject_pub_key)
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(cert_not_valid_after)
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(subject_pub_key),
+            critical=False,
+        )
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(signing_pri_key.public_key()),
+            critical=False,
+        )
+    )
+
+    if ca:
+        builder = builder.add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True).add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=True,
+                crl_sign=True,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+
+    if extra_extensions:
+        seen_extension_oids = set()
+        for extension, critical in extra_extensions:
+            if extension.oid in _GENERATE_CERT_RESERVED_EXTENSION_OIDS:
+                raise ValueError(f"extra_extensions must not include reserved extension OID '{extension.oid._name}'")
+            if extension.oid in seen_extension_oids:
+                raise ValueError(f"duplicate extra extension OID '{extension.oid._name}'")
+            seen_extension_oids.add(extension.oid)
+            builder = builder.add_extension(extension, critical=critical)
+
+    builder = builder.add_extension(
+        x509.SubjectAlternativeName(
+            build_subject_alt_names(server_default_host, server_additional_hosts, subject.name)
+        ),
+        critical=False,
+    )
+    return builder.sign(signing_pri_key, hashes.SHA256(), default_backend())
+
+
+def serialize_pri_key(pri_key, passphrase=None):
+    if passphrase is not None and not isinstance(passphrase, bytes):
+        raise TypeError(f"passphrase must be bytes or None, got {type(passphrase)}")
+    if passphrase is None:
+        return pri_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+    else:
+        return pri_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.BestAvailableEncryption(password=passphrase),
+        )
+
+
+def serialize_cert(cert):
+    return cert.public_bytes(serialization.Encoding.PEM)
+
+
+def generate_keys():
+    pri_key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
+    pub_key = pri_key.public_key()
+    return pri_key, pub_key
+
+
+def x509_name(cn_name, org_name=None, role=None):
+    name = [x509.NameAttribute(NameOID.COMMON_NAME, cn_name)]
+    if org_name is not None:
+        name.append(x509.NameAttribute(NameOID.ORGANIZATION_NAME, org_name))
+    if role:
+        name.append(x509.NameAttribute(NameOID.UNSTRUCTURED_NAME, role))
+    return x509.Name(name)
+
+
+def load_crt(path):
+    with open(path, "rb") as f:
+        return load_crt_bytes(f.read())
+
+
+def load_crt_bytes(data: bytes):
+    return x509.load_pem_x509_certificate(data, default_backend())
+
+
+def load_crt_chain(path):
+    with open(path, "rb") as f:
+        return load_crt_chain_bytes(f.read())
+
+
+def load_crt_chain_bytes(data: bytes):
+    certs = x509.load_pem_x509_certificates(data)
+    if not certs:
+        raise ValueError("no PEM certificate found")
+    return certs
+
+
+def cert_to_dict(cert):
+    return {
+        "subject": {attr.oid._name: attr.value for attr in cert.subject},
+        "issuer": {attr.oid._name: attr.value for attr in cert.issuer},
+        "version": cert.version.name,
+        "serial_number": hex(cert.serial_number),
+        # "not_valid_before": cert.not_valid_before.isoformat(),
+        # "not_valid_after": cert.not_valid_after.isoformat(),
+        # "signature_algorithm": cert.signature_algorithm.name,
+    }
+
+
+def _cert_to_submitter(cert):
+    def _get_subject_attr(oid):
+        attrs = cert.subject.get_attributes_for_oid(oid)
+        return attrs[0].value if attrs else ""
+
+    return (
+        _get_subject_attr(NameOID.COMMON_NAME),
+        _get_subject_attr(NameOID.ORGANIZATION_NAME),
+        _get_subject_attr(NameOID.UNSTRUCTURED_NAME),
+    )
+
+
+def generate_password(passlen=16):
+    s = string.ascii_letters + string.digits
+    p = "".join(secrets.choice(s) for _ in range(passlen))
+    return p
+
+
+def sign_content(content, signing_pri_key, return_str=True):
+    if isinstance(content, str):
+        content = content.encode("utf-8")  # to bytes
+    signature = signing_pri_key.sign(
+        data=content,
+        padding=_content_padding(),
+        algorithm=_content_hash_algo(),
+    )
+
+    # signature is bytes
+    if return_str:
+        return b64encode(signature).decode("utf-8")
+    else:
+        return signature
+
+
+def _content_padding():
+    return padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH)
+
+
+def _content_hash_algo():
+    return hashes.SHA256()
+
+
+def verify_content(content, signature, public_key):
+    if isinstance(content, str):
+        content = content.encode("utf-8")  # to bytes
+    if isinstance(signature, str):
+        signature = b64decode(signature.encode("utf-8"))  # decode to bytes
+    public_key.verify(
+        signature=signature,
+        data=content,
+        padding=_content_padding(),
+        algorithm=_content_hash_algo(),
+    )
+
+
+def _utc_now():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def verify_cert(cert_to_be_verified, root_ca_public_key):
+    _verify_cert_signature(cert_to_be_verified, root_ca_public_key)
+
+
+def verify_cert_chain(leaf_cert, intermediate_certs, root_ca_cert, now=None):
+    """Validate a FLARE certificate chain against the pinned project root.
+
+    FLARE uses this helper for admin, site, and server certificates, so leaf
+    purpose checks stay with the caller. The chain validation itself is handled
+    by cryptography's path verifier, with the project root as the pinned trust
+    store and normal CA constraints required for intermediates.
+    """
+    if leaf_cert is None:
+        raise ValueError("leaf_cert is required")
+    now = now or _utc_now()
+    verifier = (
+        PolicyBuilder()
+        .store(Store([root_ca_cert]))
+        .time(now)
+        .extension_policies(ca_policy=ExtensionPolicy.webpki_defaults_ca(), ee_policy=ExtensionPolicy.permit_all())
+        .build_client_verifier()
+    )
+    verifier.verify(leaf_cert, intermediate_certs or [])
+
+
+def _verify_cert_signature(cert, issuer_public_key):
+    if isinstance(issuer_public_key, rsa.RSAPublicKey):
+        issuer_public_key.verify(
+            cert.signature,
+            cert.tbs_certificate_bytes,
+            padding.PKCS1v15(),
+            cert.signature_hash_algorithm,
+        )
+    elif isinstance(issuer_public_key, ec.EllipticCurvePublicKey):
+        issuer_public_key.verify(
+            cert.signature,
+            cert.tbs_certificate_bytes,
+            ec.ECDSA(cert.signature_hash_algorithm),
+        )
+    elif isinstance(issuer_public_key, dsa.DSAPublicKey):
+        issuer_public_key.verify(
+            cert.signature,
+            cert.tbs_certificate_bytes,
+            cert.signature_hash_algorithm,
+        )
+    elif isinstance(issuer_public_key, (ed25519.Ed25519PublicKey, ed448.Ed448PublicKey)):
+        issuer_public_key.verify(cert.signature, cert.tbs_certificate_bytes)
+    else:
+        raise ValueError(f"unsupported certificate issuer public key type: {type(issuer_public_key)}")
+
+
+def load_private_key(data: str):
+    return serialization.load_pem_private_key(data.encode("ascii"), password=None, backend=default_backend())
+
+
+def load_private_key_file(file_path):
+    with open(file_path, "rb") as f:
+        return serialization.load_pem_private_key(f.read(), password=None, backend=default_backend())
+
+
+def _check_for_symlinks(root, folders, files):
+    for name in folders + files:
+        path = os.path.join(root, name)
+        if os.path.islink(path):
+            raise ValueError(f"symbolic links are not allowed in signed folders: {path}")
+
+
+def sign_folders(folder, signing_pri_key, crt_path=None, max_depth=9999, signature_file=NVFLARE_SIG_FILE):
+    if os.path.islink(folder):
+        raise ValueError(f"signed folder must not be a symbolic link: {folder}")
+
+    depth = 0
+    for root, folders, files in os.walk(folder):
+        _check_for_symlinks(root, folders, files)
+        depth = depth + 1
+        signatures = dict()
+        for file in files:
+            if file == signature_file or file == NVFLARE_SUBMITTER_CRT_FILE:
+                continue
+            with open(os.path.join(root, file), "rb") as f:
+                signatures[file] = sign_content(
+                    content=f.read(),
+                    signing_pri_key=signing_pri_key,
+                )
+        for folder in folders:
+            signatures[folder] = sign_content(
+                content=folder,
+                signing_pri_key=signing_pri_key,
+            )
+
+        with open(os.path.join(root, signature_file), "wt") as f:
+            json.dump(signatures, f)
+        if crt_path is not None:
+            shutil.copyfile(crt_path, os.path.join(root, NVFLARE_SUBMITTER_CRT_FILE))
+        if depth >= max_depth:
+            break
+
+
+def verify_folder_signature_and_get_signers(
+    src_folder, root_ca_path, single_signer=False, signature_file=NVFLARE_SIG_FILE
+):
+    """Verify the signature of each file in one folder recursively.
+
+    This function iterates over all files in one folder verifying its signature stored in the signature_file
+    of that folder.  The signature is generated either by the NVFLARE_SUBMITTER_CRT_FILE or root_ca_path.
+
+    When single_signer is True, signature is generated by root_ca_path, which exists in one place.
+    When single_signer is False, every folder contains NVFLARE_SUBMITTER_CRT_FILE, whose subject generates the signatures.
+    In this case, the certificate chain is also built and verified from NVFLARE_SUBMITTER_CRT_FILE to root CA.
+
+    Args:
+        src_folder (str): The folder to be verified.
+        root_ca_path (str): the path to root CA file.
+        single_signer (bool): True means all signatures are from root CA.  False means from NVFLARE_SUBMITTER_CRT_FILE of each folder.
+          Defaults to False.
+        signature_file (str): The file name to store signature.  Defaults to NVFLARE_SIG_FILE.
+
+    Returns:
+        A tuple of (verified, signers).
+        verified is True if all files have valid signatures.
+        verified is False if any file fails signature check.
+        signers contains unique (name, org, role) tuples from verified certificates.
+
+    """
+
+    try:
+        if os.path.islink(src_folder):
+            return False, []
+
+        root_ca_cert = load_crt(root_ca_path)
+        root_ca_public_key = root_ca_cert.public_key()
+        root_submitter = _cert_to_submitter(root_ca_cert)
+        signers = {}
+        for root, folders, files in os.walk(src_folder):
+            _check_for_symlinks(root, folders, files)
+            try:
+                with open(os.path.join(root, signature_file), "rt") as f:
+                    signatures = json.load(f)
+                if single_signer:
+                    public_key = root_ca_public_key
+                    signer = root_submitter
+                else:
+                    cert_chain = load_crt_chain(os.path.join(root, NVFLARE_SUBMITTER_CRT_FILE))
+                    cert = cert_chain[0]
+                    public_key = cert.public_key()
+                    verify_cert_chain(
+                        leaf_cert=cert,
+                        intermediate_certs=cert_chain[1:],
+                        root_ca_cert=root_ca_cert,
+                    )
+                    validate_admin_leaf_cert(cert)
+                    signer = _cert_to_submitter(cert)
+                signers[signer] = signer
+            except Exception:
+                return False, []
+
+            for file in files:
+                if file == signature_file or file == NVFLARE_SUBMITTER_CRT_FILE:
+                    continue
+                signature = signatures.get(file)
+                if signature:
+                    with open(os.path.join(root, file), "rb") as f:
+                        verify_content(
+                            content=f.read(),
+                            signature=signature,
+                            public_key=public_key,
+                        )
+                else:
+                    return False, []
+            for folder in folders:
+                signature = signatures.get(folder)
+                if signature:
+                    verify_content(
+                        content=folder,
+                        signature=signature,
+                        public_key=public_key,
+                    )
+                else:
+                    return False, []
+        return True, list(signers.values())
+    except Exception:
+        return False, []
+
+
+def verify_folder_signature(src_folder, root_ca_path, single_signer=False, signature_file=NVFLARE_SIG_FILE):
+    """Verify folder signatures and preserve the legacy boolean return contract."""
+    verified, _signers = verify_folder_signature_and_get_signers(
+        src_folder, root_ca_path, single_signer, signature_file
+    )
+    return verified
+
+
+def sign_all(content_folder, signing_pri_key):
+    signatures = dict()
+    for f in os.listdir(content_folder):
+        path = os.path.join(content_folder, f)
+        if os.path.isfile(path):
+            with open(path, "rb") as file:
+                signatures[f] = sign_content(
+                    content=file.read(),
+                    signing_pri_key=signing_pri_key,
+                )
+    return signatures
+
+
+def load_yaml(file):
+
+    root = os.path.split(file)[0]
+    if isinstance(file, str) or isinstance(file, Path):
+        with open(file, "r") as f:
+            yaml_data = yaml.safe_load(f)
+    elif isinstance(file, bytes):
+        yaml_data = yaml.safe_load(file)
+    else:
+        raise ValueError(f"Invalid file type: {type(file)}")
+
+    yaml_data = load_yaml_include(root, yaml_data)
+
+    return yaml_data
+
+
+def _resolve_include_path(root, item):
+    root_real = os.path.realpath(root or ".")
+    include_path = os.path.realpath(os.path.join(root_real, item))
+    try:
+        common = os.path.commonpath([root_real, include_path])
+    except ValueError:
+        raise ValueError(f"include path escapes root: {item}")
+    if common != root_real:
+        raise ValueError(f"include path escapes root: {item}")
+    return include_path
+
+
+def load_yaml_include(root, yaml_data):
+    new_data = {}
+    for k, v in yaml_data.items():
+        if k == "include":
+            if isinstance(v, str):
+                includes = [v]
+            elif isinstance(v, list):
+                includes = v
+            for item in includes:
+                new_data.update(load_yaml(_resolve_include_path(root, item)))
+        elif isinstance(v, list):
+            new_list = []
+            for item in v:
+                if isinstance(item, dict):
+                    item = load_yaml_include(root, item)
+                new_list.append(item)
+            new_data[k] = new_list
+        elif isinstance(v, dict):
+            new_data[k] = load_yaml_include(root, v)
+        else:
+            new_data[k] = v
+
+    return new_data
+
+
+def sh_replace(src, mapping_dict):
+    result = src
+    for k, v in mapping_dict.items():
+        result = result.replace("{~~" + k + "~~}", str(v))
+    return result
+
+
+def update_project_server_name_config(project_config: dict, old_server_name, server_name) -> dict:
+    update_participant_server_name(project_config, old_server_name, server_name)
+    return project_config
+
+
+def update_participant_server_name(project_config, old_server_name, new_server_name):
+    participants = project_config["participants"]
+    for p in participants:
+        if p["type"] == "server" and p["name"] == old_server_name:
+            p["name"] = new_server_name
+            break
+    return project_config
+
+
+def update_server_default_host(project_config, default_host):
+    """Update the default_host property of the Server in the project config.
+    If a client does not explicitly specify "connect_to", it will use the default_host to connect to server.
+    This is mainly used for POC, where the default_host is set to localhost.
+
+    Args:
+        project_config: the project config dict
+        default_host: value of the default host
+
+    Returns: the updated project_config
+
+    """
+    participants = project_config["participants"]
+    for p in participants:
+        if p["type"] == "server":
+            p["default_host"] = default_host
+            break
+    return project_config
+
+
+def update_project_server_name(project_file: str, old_server_name, server_name):
+    with open(project_file, "r") as file:
+        project_config = yaml.safe_load(file)
+
+    if not project_config:
+        raise RuntimeError("project_config is empty")
+
+    update_project_server_name_config(project_config, old_server_name, server_name)
+
+    with open(project_file, "w") as file:
+        yaml.dump(project_config, file)
+
+
+def update_storage_locations(
+    local_dir: str,
+    workspace: str,
+    default_resource_name: str = "resources.json.default",
+    job_storage_name: str = "jobs-storage",
+    snapshot_storage_name: str = "snapshot-storage",
+):
+    """Creates resources.json with snapshot-storage and jobs-storage set as folders directly under the workspace
+    for the provided local_dir."""
+    default_resource = f"{local_dir}/{default_resource_name}"
+    target_resource = f"{local_dir}/resources.json"
+    job_storage = f"{workspace}/{job_storage_name}"
+    snapshot_storage = f"{workspace}/{snapshot_storage_name}"
+
+    # load resources.json
+    with open(default_resource, "r") as f:
+        resources = json.load(f)
+
+    # update resources
+    resources["snapshot_persistor"]["args"]["storage"]["args"]["root_dir"] = snapshot_storage
+    components = resources["components"]
+    job_mgr_comp = [comp for comp in components if comp["id"] == "job_manager"][0]
+    job_mgr_comp["args"]["uri_root"] = job_storage
+
+    # Serializing json, Writing to resources.json
+    json_object = json.dumps(resources, indent=4)
+    with open(target_resource, "w") as outfile:
+        outfile.write(json_object)
+
+
+def make_dirs(dirs):
+    for d in dirs:
+        if not os.path.exists(d):
+            os.makedirs(d)
+
+
+def _write(file_full_path, content, mode, exe=False):
+    mode = mode + "w"
+    with open(file_full_path, mode) as f:
+        f.write(content)
+    if exe:
+        os.chmod(file_full_path, 0o755)
+
+
+def write(file_full_path, content, mode, exe=False):
+    _write(file_full_path, content, mode, exe)
+
+
+def add_component_to_resources(resources_file: str, component: dict):
+    """Add a component to the resources file, merging with existing components.
+
+    Args:
+        resources_file: The name of the resource file
+        component: The component to add
+    """
+    components = []
+    if os.path.exists(resources_file):
+        with open(resources_file, "r") as f:
+            existing = json.load(f)
+            components = existing.get("components", [])
+
+    components.append(component)
+    write(
+        resources_file,
+        json.dumps({"components": components}, indent=2),
+        "t",
+    )

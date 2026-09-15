@@ -1,0 +1,837 @@
+# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import logging
+import os
+import posixpath
+import re
+import threading
+import time
+from abc import abstractmethod
+from urllib.parse import urlsplit, urlunsplit
+
+try:
+    import docker.errors
+
+    import docker
+
+    _DOCKER_AVAILABLE = True
+except ImportError:
+    _DOCKER_AVAILABLE = False
+
+from nvflare.apis.app_validation import AppValidationKey
+from nvflare.apis.event_type import EventType
+from nvflare.apis.fl_constant import ConnectionSecurity, FLContextKey, JobConstants, WorkspaceConstants
+from nvflare.apis.fl_context import FLContext
+from nvflare.apis.job_def import JobMetaKey
+from nvflare.apis.job_launcher_spec import JobHandleSpec, JobLauncherSpec, JobProcessArgs, JobReturnCode, add_launcher
+from nvflare.apis.workspace import Workspace
+from nvflare.app_opt.job_launcher.study_data import (
+    load_study_data_file,
+    resolve_study_dataset_mounts,
+    should_mount_study_data,
+)
+from nvflare.app_opt.job_launcher.study_runtime import (
+    RESERVED_DOCKER_KWARGS,
+    STUDY_RUNTIME_FILE,
+    load_study_runtime_file,
+    resolve_study_runtime,
+)
+from nvflare.fuel.f3.comm_error import CommError
+from nvflare.fuel.f3.drivers.file_driver import SCHEME as SHARED_FILE_SCHEME
+from nvflare.fuel.f3.drivers.file_driver import parse_file_url
+from nvflare.utils.job_launcher_utils import (
+    DOCKER_JOB_CONTAINER_KWARGS,
+    get_client_job_args,
+    get_credential_env,
+    get_job_launcher_spec,
+    get_portable_resource_spec,
+    get_server_job_args,
+    portable_memory_to_bytes,
+    validate_docker_job_launcher_spec,
+)
+
+
+# Docker container status strings
+class DockerStatus:
+    CREATED = "created"
+    RESTARTING = "restarting"
+    RUNNING = "running"
+    PAUSED = "paused"
+    EXITED = "exited"
+    DEAD = "dead"
+
+
+TERMINAL_STATUSES = {DockerStatus.EXITED, DockerStatus.DEAD}
+# Docker tmpfs mounts are commonly owned by root; use sticky world-writable mode so the
+# non-root job-container user can initialize ephemeral top-level workspace directories.
+_WORKSPACE_TMPFS_MODE = 0o1777
+_RESERVED_WORKSPACE_CHILD_NAMES = {
+    WorkspaceConstants.STARTUP_FOLDER_NAME,
+    WorkspaceConstants.SITE_FOLDER_NAME,
+}
+# Site-level defaults and study docker_kwargs additionally reserve "image": jobs select
+# their image through docker_spec["image"], so it must not trip the job-spec warning.
+_RESERVED_DEFAULT_KWARGS = RESERVED_DOCKER_KWARGS
+
+
+def _rewrite_parent_url(job_args: dict, site_name: str) -> tuple[dict, str | None]:
+    """Rewrite a parent URL to Docker DNS while preserving its transport security."""
+    entry = job_args.get(JobProcessArgs.PARENT_URL)
+    if not entry:
+        return job_args, None
+    if not isinstance(entry, (tuple, list)) or len(entry) != 2:
+        raise ValueError(f"malformed {JobProcessArgs.PARENT_URL} in JOB_PROCESS_ARGS")
+
+    connection_entry = job_args.get(JobProcessArgs.PARENT_CONN_SEC, (None, ConnectionSecurity.CLEAR))
+    if not isinstance(connection_entry, (tuple, list)) or len(connection_entry) != 2:
+        raise ValueError(f"malformed {JobProcessArgs.PARENT_CONN_SEC} in JOB_PROCESS_ARGS")
+    connection_security = connection_entry[1]
+    if connection_security not in (ConnectionSecurity.CLEAR, ConnectionSecurity.MTLS):
+        raise ValueError("Docker job launch requires clear or mTLS parent connection security")
+
+    flag, original_url = entry
+    try:
+        parsed = urlsplit(str(original_url))
+    except ValueError as e:
+        raise ValueError(f"invalid parent URL {original_url!r}") from e
+
+    if parsed.scheme == SHARED_FILE_SCHEME:
+        if connection_security != ConnectionSecurity.CLEAR:
+            raise ValueError("shared-file parent URL scheme does not match parent connection security")
+        try:
+            file_parent_dir = parse_file_url(str(original_url))
+        except CommError as e:
+            raise ValueError(f"invalid shared-file parent URL {original_url!r}: {e}") from e
+        return dict(job_args), file_parent_dir
+
+    try:
+        port = parsed.port
+        host = parsed.hostname
+    except ValueError as e:
+        raise ValueError(f"invalid parent URL {original_url!r}") from e
+    if parsed.scheme not in ("tcp", "stcp") or not host or not port:
+        raise ValueError(f"parent URL must use {SHARED_FILE_SCHEME}, tcp, or stcp with a host and port")
+    if (parsed.scheme == "stcp") != (connection_security == ConnectionSecurity.MTLS):
+        raise ValueError("parent URL scheme does not match parent connection security")
+
+    parent_url = urlunsplit((parsed.scheme, f"{site_name}:{port}", parsed.path, parsed.query, parsed.fragment))
+    copied = dict(job_args)
+    copied[JobProcessArgs.PARENT_URL] = (flag, parent_url)
+    return copied, None
+
+
+def _sanitize_container_name(name: str) -> str:
+    """Sanitize a string to a valid Docker container name.
+
+    Docker container names allow alphanumeric, hyphens, underscores, and dots.
+    """
+    name = name.lower()
+    name = re.sub(r"[^a-z0-9\-_.]", "-", name)
+    name = name.strip("-")
+    return name or "nvflare-job"
+
+
+def _exit_code_to_return_code(exit_code: int) -> JobReturnCode:
+    if exit_code == 0:
+        return JobReturnCode.SUCCESS
+    elif exit_code == JobReturnCode.ABORTED:
+        return JobReturnCode.ABORTED
+    else:
+        return JobReturnCode.EXECUTION_ERROR
+
+
+def _safe_workspace_child_path(workspace: str, child_name: str, allow_reserved: bool = False) -> str:
+    """Return a host workspace child path, rejecting paths that escape workspace."""
+    child_name = str(child_name)
+    normalized_child_name = os.path.normpath(child_name)
+    # normpath catches traversal spellings; the separator checks catch already-normalized nested paths.
+    if (
+        not child_name
+        or os.path.isabs(child_name)
+        or normalized_child_name != child_name
+        or normalized_child_name in ("", ".", "..")
+        or os.sep in normalized_child_name
+        or (os.altsep and os.altsep in normalized_child_name)
+    ):
+        raise RuntimeError(f"job workspace path must be a single workspace child: {child_name}")
+    if not allow_reserved and normalized_child_name in _RESERVED_WORKSPACE_CHILD_NAMES:
+        raise RuntimeError(f"job workspace path uses reserved workspace name: {child_name}")
+
+    child_path = os.path.normpath(os.path.join(workspace, child_name))
+    workspace_real = os.path.realpath(workspace)
+    child_real = os.path.realpath(child_path)
+    if os.path.commonpath([workspace_real, child_real]) != workspace_real:
+        raise RuntimeError(f"job workspace path escapes workspace: {child_name}")
+    if os.path.islink(child_path):
+        raise RuntimeError(f"workspace child path must not be a symlink: {child_name}")
+    return child_path
+
+
+class DockerJobHandle(JobHandleSpec):
+    """Handle for a running Docker container job.
+
+    Modeled on K8sJobHandle: once the container reaches a terminal state,
+    terminal_state is set and all subsequent poll()/wait() calls return
+    immediately without querying Docker.
+    """
+
+    def __init__(
+        self,
+        container_id: str,
+        container_name: str,
+        docker_client,
+        timeout: int = 30,
+        container=None,
+        watch_exit: bool = True,
+    ):
+        super().__init__()
+        self.container_id = container_id
+        self.container_name = container_name
+        self.docker_client = docker_client
+        self.timeout = timeout
+        self.terminal_state: JobReturnCode = None  # set once, never cleared
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self._state_lock = threading.Lock()
+        self._exit_watch_done = threading.Event()
+        self._exit_watcher = None
+        self._terminating = False
+        if watch_exit and container is not None:
+            self._start_exit_watcher(container)
+
+    def _get_terminal_state(self) -> JobReturnCode:
+        with self._state_lock:
+            return self.terminal_state
+
+    def _set_terminal_state(self, return_code: JobReturnCode):
+        with self._state_lock:
+            if self.terminal_state is None:
+                self.terminal_state = return_code
+
+    def _set_terminating(self):
+        with self._state_lock:
+            self._terminating = True
+
+    def _is_terminating(self) -> bool:
+        with self._state_lock:
+            return self._terminating
+
+    def _start_exit_watcher(self, container):
+        self._exit_watcher = threading.Thread(
+            target=self._watch_container_exit,
+            args=(container,),
+            name=f"docker-job-wait-{self.container_name}",
+            daemon=True,
+        )
+        self._exit_watcher.start()
+
+    def _watch_container_exit(self, container):
+        """Cache the exit code while Docker still has container metadata."""
+        try:
+            wait_result = container.wait()
+            if not isinstance(wait_result, dict):
+                self.logger.warning(f"unexpected wait result for container {self.container_name}: {wait_result}")
+                return
+            exit_code = wait_result.get("StatusCode")
+            if exit_code is None:
+                self.logger.warning(f"wait result for container {self.container_name} did not include StatusCode")
+                return
+            try:
+                exit_code = int(exit_code)
+            except (TypeError, ValueError):
+                self.logger.warning(f"invalid exit code for container {self.container_name}: {exit_code}")
+                return
+            return_code = JobReturnCode.ABORTED if self._is_terminating() else _exit_code_to_return_code(exit_code)
+            self._set_terminal_state(return_code)
+        except docker.errors.NotFound:
+            self.logger.info(
+                f"container {self.container_name} not found while waiting; exit code unavailable, marking aborted"
+            )
+            self._set_terminal_state(JobReturnCode.ABORTED)
+        except docker.errors.APIError as e:
+            self.logger.warning(f"error waiting for container {self.container_name}: {e}")
+        except Exception as e:
+            self.logger.warning(f"unexpected error waiting for container {self.container_name}: {e}")
+        finally:
+            self._exit_watch_done.set()
+
+    def _get_container(self):
+        """Query Docker for the current container object.
+
+        Returns None if not found or on API error. NotFound sets terminal_state only
+        when no exit watcher can still provide the container's final exit code.
+        """
+        try:
+            return self.docker_client.containers.get(self.container_id)
+        except docker.errors.NotFound:
+            self.logger.info(f"container {self.container_name} not found")
+            if self._exit_watcher is None or self._exit_watch_done.is_set():
+                self._set_terminal_state(JobReturnCode.ABORTED)
+            return None
+        except docker.errors.APIError as e:
+            self.logger.warning(f"error querying container {self.container_name}: {e}")
+            return None
+        except Exception as e:
+            self.logger.warning(f"unexpected error querying container {self.container_name}: {e}")
+            return None
+
+    def _resolve_terminal_return_code(self, container) -> JobReturnCode:
+        """Get the final JobReturnCode from a terminal container using exit code."""
+        if container.status == DockerStatus.DEAD:
+            return JobReturnCode.ABORTED
+        # EXITED: read actual exit code from container attrs
+        exit_code = container.attrs.get("State", {}).get("ExitCode", 1)
+        return _exit_code_to_return_code(exit_code)
+
+    def _remove_container(self):
+        """Remove the container after it has reached a terminal state."""
+        try:
+            container = self.docker_client.containers.get(self.container_id)
+            container.remove(force=True)
+            self.logger.debug(f"removed container {self.container_name}")
+        except docker.errors.NotFound:
+            pass  # already gone
+        except docker.errors.APIError as e:
+            self.logger.warning(f"error removing container {self.container_name}: {e}")
+
+    def poll(self) -> JobReturnCode:
+        """Non-blocking status check. Returns UNKNOWN while still running."""
+        terminal_state = self._get_terminal_state()
+        if terminal_state is not None:
+            return terminal_state
+        container = self._get_container()
+        terminal_state = self._get_terminal_state()
+        if container is None:
+            return terminal_state if terminal_state is not None else JobReturnCode.UNKNOWN
+        if container.status in TERMINAL_STATUSES:
+            rc = self._resolve_terminal_return_code(container)
+            self._set_terminal_state(rc)
+            self._remove_container()
+            return self._get_terminal_state()
+        return JobReturnCode.UNKNOWN
+
+    def wait(self):
+        """Block until the container reaches a terminal state."""
+        while True:
+            if self._get_terminal_state() is not None:
+                return
+            if self._exit_watcher is not None and not self._exit_watch_done.is_set():
+                self._exit_watch_done.wait(timeout=1)
+                continue
+            container = self._get_container()
+            if container is None:
+                return
+            if container.status in TERMINAL_STATUSES:
+                self._set_terminal_state(self._resolve_terminal_return_code(container))
+                self._remove_container()
+                return
+            time.sleep(1)
+
+    def terminate(self):
+        """Stop and remove the container. Always sets terminal_state."""
+        if self._get_terminal_state() is None:
+            self._set_terminating()
+        try:
+            container = self.docker_client.containers.get(self.container_id)
+            container.stop(timeout=0)
+            container.remove(force=True)
+        except docker.errors.NotFound:
+            self.logger.info(f"container {self.container_name} not found during termination; assuming terminated")
+        except docker.errors.APIError as e:
+            self.logger.error(f"error terminating container {self.container_name}: {e}")
+        except Exception as e:
+            self.logger.error(f"unexpected error terminating container {self.container_name}: {e}")
+        finally:
+            # Always set terminal_state so poll()/wait() return immediately
+            self._set_terminal_state(JobReturnCode.ABORTED)
+
+    def enter_states(self, states_to_enter: list) -> bool:
+        """Poll until the container enters one of the target states.
+
+        Returns True if the target state was reached, False otherwise
+        (timeout, stuck, or terminal state reached before target).
+        """
+        starting_time = time.time()
+        if not isinstance(states_to_enter, (list, tuple)):
+            states_to_enter = [states_to_enter]
+
+        while True:
+            if self._get_terminal_state() is not None:
+                return False
+
+            container = self._get_container()
+            if container is None:
+                return False
+
+            status = container.status
+
+            if status in states_to_enter:
+                return True
+
+            if status in TERMINAL_STATUSES:
+                self._set_terminal_state(self._resolve_terminal_return_code(container))
+                self._remove_container()
+                return False
+
+            if self.timeout is not None and time.time() - starting_time > self.timeout:
+                self.logger.warning(f"container {self.container_name} timed out waiting for {states_to_enter}")
+                self.terminate()
+                return False
+
+            time.sleep(1)
+
+
+def _job_args_dict(job_args: dict, arg_names: list) -> dict:
+    """Extract a {flag: value} dict from JOB_PROCESS_ARGS for the given arg names."""
+    result = {}
+    for name in arg_names:
+        e = job_args.get(name)
+        if not e:
+            continue
+        flag, value = e
+        result[flag] = value
+    return result
+
+
+class DockerJobLauncher(JobLauncherSpec):
+    """Launches NVFlare job processes as Docker containers.
+
+    SP/CP runs as a container started by start_docker.sh (site admin).
+    SJ/CJ containers are started dynamically per job by this launcher.
+
+    Assumptions:
+    - Docker network already exists (created by start_docker.sh or site admin).
+    - Job containers get an isolated workspace view at /var/tmp/nvflare/workspace:
+      the root is writable ephemeral tmpfs, startup/local are read-only, and only the current
+      job workspace is read-write and persistent on the host.
+    - SP/CP container name is known and reachable via Docker DNS on the network.
+    - parent_url is derived at runtime from the site name and the port in JOB_PROCESS_ARGS.
+    """
+
+    WORKSPACE_MOUNT = "/var/tmp/nvflare/workspace"
+    STUDY_DATA_PATH_FILE = "local/study_data.yaml"
+    NETWORK_ENV = "NVFL_DOCKER_NETWORK"
+
+    DEFAULT_PYTHON_PATH = "/usr/local/bin/python"
+
+    def __init__(
+        self,
+        workspace: str = None,
+        network: str = "nvflare-network",
+        python_path: str = None,
+        timeout: int = 30,
+        default_job_container_kwargs: dict = None,
+        default_job_env: dict = None,
+        default_python_path: str = None,
+    ):
+        """
+        Args:
+            workspace: host path to the NVFlare workspace directory. Job containers receive an isolated
+                       workspace view: startup/local are mounted read-only, and the current job workspace
+                       is mounted read-write at /var/tmp/nvflare/workspace/<job_id>. If not provided,
+                       reads from NVFL_DOCKER_WORKSPACE environment variable. Must be the HOST path
+                       because it is passed directly to the Docker daemon as a volume bind source.
+            network: Docker network name. Must already exist. The parent runtime can override it with
+                     ``NVFL_DOCKER_NETWORK`` so parent and job containers use the same runtime-selected network.
+            python_path: Deprecated alias for default_python_path.
+            timeout: max seconds to wait for container to reach RUNNING state (default 30).
+            default_job_container_kwargs: site-level default docker run kwargs applied to every job
+                                          container launched by this site. Explicitly allowlisted job options from
+                                          launcher_spec[site][docker] take precedence. Keys use Docker SDK naming
+                                          (underscores, not hyphens).
+                                          Example: {"shm_size": "8g", "ipc_mode": "host"}
+                                          Note: "volumes", "mounts", "network", "environment", "command",
+                                          "name", "detach", "auto_remove", "user", "working_dir", and "image"
+                                          are controlled by the launcher and cannot be overridden here; a site
+                                          default job image belongs in studies.<study>.container.image in
+                                          local/study_runtime.yaml.
+            default_job_env: site-level default environment variables injected into every job
+                             container launched by this site. Useful for site/runtime-specific
+                             settings such as NCCL workarounds. Launcher-controlled variables
+                             like USER, HOME, and PYTHONPATH still take precedence.
+            default_python_path: Default Python executable path inside job containers. Jobs can override
+                                 it with launcher_spec[site]["docker"]["python_path"].
+        """
+        super().__init__()
+        self.logger = logging.getLogger(self.__class__.__name__)
+
+        if not workspace:
+            workspace = os.environ.get("NVFL_DOCKER_WORKSPACE")
+
+        self.workspace = workspace
+        self.network = os.environ.get(self.NETWORK_ENV, network)
+        self.default_python_path = default_python_path if default_python_path is not None else python_path
+        if self.default_python_path is None:
+            self.default_python_path = self.DEFAULT_PYTHON_PATH
+        if not isinstance(self.default_python_path, str) or not self.default_python_path.strip():
+            raise ValueError("default_python_path must be a non-empty string")
+        self.timeout = timeout
+        default_job_container_kwargs = default_job_container_kwargs or {}
+        reserved_used = _RESERVED_DEFAULT_KWARGS & set(default_job_container_kwargs.keys())
+        if reserved_used:
+            raise ValueError(
+                f"default_job_container_kwargs must not contain reserved keys: {sorted(reserved_used)}. "
+                f"These are controlled by the launcher."
+            )
+        self.default_job_container_kwargs = default_job_container_kwargs
+        self.default_job_env = default_job_env or {}
+
+        self._docker_client = None
+
+    def _resolve_study_runtime(self, study):
+        # Reads use WORKSPACE_MOUNT (container-internal path) because launch_job runs inside
+        # the SP/CP container; the host path (self.workspace) is not visible here.
+        runtime_file = os.path.join(self.WORKSPACE_MOUNT, *STUDY_RUNTIME_FILE.split("/"))
+        if not os.path.exists(runtime_file):
+            return None
+        legacy_file = os.path.join(self.WORKSPACE_MOUNT, self.STUDY_DATA_PATH_FILE)
+        if os.path.exists(legacy_file):
+            raise RuntimeError(
+                f"study runtime file '{runtime_file}' cannot be combined with the legacy study data file "
+                f"'{legacy_file}'; migrate all studies to study_runtime.yaml and remove the v1 file."
+            )
+        runtime_map = load_study_runtime_file(runtime_file, launcher_mode="docker", logger=self.logger)
+        study_runtime = resolve_study_runtime(runtime_map, study, runtime_file, logger=self.logger)
+        self._validate_docker_kwargs_keys(study_runtime.docker_kwargs, runtime_file)
+        return study_runtime
+
+    def _validate_docker_kwargs_keys(self, docker_kwargs: dict, runtime_file: str) -> None:
+        """Fail fast on kwargs the installed Docker SDK does not model.
+
+        Without this, unknown keys surface as a TypeError from containers.run at
+        every job launch. Skipped when the SDK does not expose its kwargs lists.
+        """
+        if not docker_kwargs:
+            return
+        try:
+            from docker.models.containers import RUN_CREATE_KWARGS, RUN_HOST_CONFIG_KWARGS
+        except ImportError:
+            return
+        known = set(RUN_CREATE_KWARGS) | set(RUN_HOST_CONFIG_KWARGS)
+        unknown = sorted(set(docker_kwargs) - known)
+        if unknown:
+            raise RuntimeError(
+                f"study runtime file '{runtime_file}': docker_kwargs key(s) {unknown} are not supported "
+                "by the installed Docker SDK"
+            )
+
+    def _get_docker_client(self):
+        if self._docker_client is None:
+            if not _DOCKER_AVAILABLE:
+                raise RuntimeError("docker SDK not installed; install it with: pip install docker")
+            try:
+                client = docker.from_env()
+                client.ping()
+            except Exception as e:
+                raise RuntimeError(f"cannot connect to Docker daemon: {e}")
+            try:
+                client.networks.get(self.network)
+            except docker.errors.NotFound:
+                raise RuntimeError(
+                    f"Docker network '{self.network}' does not exist. "
+                    f"Create it with: docker network create {self.network}"
+                )
+            except docker.errors.APIError as e:
+                raise RuntimeError(f"error checking Docker network '{self.network}': {e}")
+            self._docker_client = client
+        return self._docker_client
+
+    def launch_job(self, job_meta: dict, fl_ctx: FLContext) -> JobHandleSpec:
+        job_id = job_meta.get(JobConstants.JOB_ID)
+        if not job_id:
+            raise RuntimeError("missing JOB_ID in job_meta")
+
+        job_args = fl_ctx.get_prop(FLContextKey.JOB_PROCESS_ARGS)
+        if not job_args:
+            raise RuntimeError(f"missing {FLContextKey.JOB_PROCESS_ARGS} in FLContext")
+
+        exe_module_entry = job_args.get(JobProcessArgs.EXE_MODULE)
+        if not exe_module_entry:
+            raise RuntimeError(f"missing {JobProcessArgs.EXE_MODULE} in JOB_PROCESS_ARGS")
+        _, exe_module = exe_module_entry
+
+        site_name = fl_ctx.get_identity_name()
+        docker_spec = get_job_launcher_spec(job_meta, site_name, "docker")
+        job_image = docker_spec.get("image")
+        if job_image is not None and not isinstance(job_image, str):
+            raise RuntimeError(
+                f"launcher_spec docker image for site '{site_name}' must be a string, "
+                f"got {type(job_image).__name__}: {job_image!r}"
+            )
+        python_path = docker_spec.get("python_path", self.default_python_path)
+        if not isinstance(python_path, str) or not python_path.strip():
+            raise RuntimeError(f"launcher_spec['{site_name}']['docker']['python_path'] must be a non-empty string")
+        try:
+            validate_docker_job_launcher_spec(docker_spec, f"job Docker spec for site '{site_name}'")
+        except ValueError as e:
+            raise RuntimeError(str(e)) from e
+        if "entrypoint" in docker_spec and not job_meta.get(AppValidationKey.BYOC, False):
+            raise RuntimeError(
+                f"job Docker spec for site '{site_name}' contains entrypoint but lacks locally authorized BYOC"
+            )
+        portable_spec = get_portable_resource_spec(job_meta, site_name)
+        container_name = _sanitize_container_name(f"{site_name}-{job_id}")
+        study = job_meta.get(JobMetaKey.STUDY.value)
+        study_runtime = self._resolve_study_runtime(study)
+        if not job_image and study_runtime is not None:
+            # job-supplied image wins; the study's container.image is the site default
+            job_image = study_runtime.container_image
+        if not job_image:
+            raise RuntimeError(
+                f"DockerJobLauncher is configured for site '{site_name}' but no job image "
+                f"was specified in meta.json for this site. "
+                f"Set launcher_spec['{site_name}']['docker']['image'] (preferred), "
+                f"launcher_spec['default']['docker']['image'] (shared default), "
+                f"resource_spec['{site_name}']['docker']['image'] (legacy), "
+                f"or studies.<study>.container.image in local/study_runtime.yaml (site default)."
+            )
+
+        workspace = self.workspace
+        if not workspace:
+            raise ValueError(
+                "workspace must be set to the host path of the NVFlare workspace directory, "
+                "or set the NVFL_DOCKER_WORKSPACE environment variable"
+            )
+
+        # Derive parent_url at runtime: site name (= container name on Docker DNS) + port
+        # from the original PARENT_URL in job_args. This avoids baking parent_url into
+        # resources.json at provision time.
+        job_args, file_parent_dir = _rewrite_parent_url(job_args, site_name)
+        if file_parent_dir and file_parent_dir.startswith(self.WORKSPACE_MOUNT):
+            raise ValueError(f"shared-file parent directory {file_parent_dir} overlaps the container workspace mount")
+
+        module_args = self.get_module_args(job_args)
+        module_args_list = []
+        for flag, value in module_args.items():
+            if value is not None:
+                module_args_list.extend([flag, str(value)])
+
+        # Append --set options (same as K8s launcher)
+        args = fl_ctx.get_prop(FLContextKey.ARGS)
+        set_list = args.set if args is not None and getattr(args, "set", None) is not None else None
+        if set_list:
+            module_args_list.extend(["--set"] + set_list)
+
+        command = [python_path, "-u", "-m", exe_module] + module_args_list
+
+        site_env = {}
+        if study_runtime is not None:
+            site_env.update(study_runtime.env)
+            for secret_env_ref in study_runtime.secret_env:
+                secret_value = os.environ.get(secret_env_ref.source)
+                if secret_value is None:
+                    raise RuntimeError(
+                        f"secret_env '{secret_env_ref.name}' for study '{study}' requires env var "
+                        f"'{secret_env_ref.source}' in the launcher environment, but it is not set"
+                    )
+                site_env[secret_env_ref.name] = secret_value
+
+        # PYTHONPATH: translate app_custom_folder host path to container-internal path
+        # so custom Python code in the job app is importable inside the container.
+        # USER: some libraries (e.g. torch._dynamo) call getpass.getuser() which falls back to
+        # pwd.getpwuid(os.getuid()). When the container runs as a host UID not in /etc/passwd,
+        # this raises KeyError. Setting USER satisfies the env-var fast path in getpass.getuser().
+        # Pass USER and HOME so libraries that call getpass.getuser() or os.path.expanduser("~")
+        # don't fall back to pwd.getpwuid() — which fails when the host UID has no /etc/passwd entry.
+        environment = {
+            **self.default_job_env,
+            **site_env,
+            "USER": os.environ.get("USER", "nvflare"),
+            "HOME": os.environ.get("HOME", "/tmp"),
+        }
+        environment.update(get_credential_env(job_args))
+        workspace_obj: Workspace = fl_ctx.get_prop(FLContextKey.WORKSPACE_OBJECT)
+        if workspace_obj is not None:
+            python_paths = []
+            app_custom_folder = workspace_obj.get_app_custom_dir(job_id)
+            if app_custom_folder:
+                python_paths.append(app_custom_folder.replace(workspace, self.WORKSPACE_MOUNT, 1))
+            site_custom_folder = workspace_obj.get_site_custom_dir()
+            if site_custom_folder and os.path.isdir(site_custom_folder):
+                python_paths.append(site_custom_folder.replace(workspace, self.WORKSPACE_MOUNT, 1))
+            if python_paths:
+                environment["PYTHONPATH"] = os.pathsep.join(python_paths)
+
+        # Docker launcher spec: allowlisted per-job Docker settings (image, shm_size, ...) live in
+        # launcher_spec[site][docker]. Falls back to nested resource_spec[site][docker] for
+        # backward compatibility. Portable resources come from the resolved resource_spec.
+        # Site-level defaults (default_job_container_kwargs) are merged in; job-level takes precedence on conflict.
+        num_gpus = docker_spec.get("num_of_gpus", portable_spec.get("num_of_gpus", 0))
+        job_gpus_specified = "num_of_gpus" in portable_spec or "num_of_gpus" in docker_spec
+        job_container_kwargs = {k: docker_spec[k] for k in DOCKER_JOB_CONTAINER_KWARGS if k in docker_spec}
+        study_docker_kwargs = study_runtime.docker_kwargs if study_runtime is not None else {}
+        merged_container_kwargs = {**self.default_job_container_kwargs, **study_docker_kwargs, **job_container_kwargs}
+
+        # GPU precedence:
+        # 1. job-level num_of_gpus translated to device_requests; an explicit 0 declines
+        #    GPUs and drops any study/site-inherited device_requests
+        # 2. study-level device_requests from docker_kwargs in study_runtime.yaml
+        # 3. site-level default device_requests from default_job_container_kwargs
+        #
+        # This preserves the documented rule that job-level resource_spec takes precedence
+        # over study and site-level defaults. Fine-grained device_requests remain site-owned.
+        if num_gpus:
+            merged_container_kwargs["device_requests"] = [{"Count": num_gpus, "Capabilities": [["gpu"]]}]
+        elif job_gpus_specified:
+            merged_container_kwargs.pop("device_requests", None)
+        if "num_of_cpus" in portable_spec:
+            merged_container_kwargs["nano_cpus"] = portable_spec["num_of_cpus"] * 1_000_000_000
+        if "memory" in portable_spec:
+            merged_container_kwargs["mem_limit"] = portable_memory_to_bytes(portable_spec["memory"])
+
+        # Give the job an isolated workspace view. The root tmpfs must be writable by the non-root
+        # container user because server job startup may create ephemeral storage dirs such as
+        # snapshot-storage and jobs-storage.
+        # startup/local are read-only, and only this job's workspace is read-write and persistent on the host.
+        job_workspace_name = WorkspaceConstants.WORKSPACE_PREFIX + str(job_id)
+        host_job_workspace = _safe_workspace_child_path(workspace, job_workspace_name)
+        host_startup_dir = _safe_workspace_child_path(
+            workspace, WorkspaceConstants.STARTUP_FOLDER_NAME, allow_reserved=True
+        )
+        host_local_dir = _safe_workspace_child_path(workspace, WorkspaceConstants.SITE_FOLDER_NAME, allow_reserved=True)
+        container_job_workspace = posixpath.join(self.WORKSPACE_MOUNT, job_workspace_name)
+        container_startup_dir = posixpath.join(self.WORKSPACE_MOUNT, WorkspaceConstants.STARTUP_FOLDER_NAME)
+        container_local_dir = posixpath.join(self.WORKSPACE_MOUNT, WorkspaceConstants.SITE_FOLDER_NAME)
+        # Dataset sources are host paths for Docker (bind sources go to the daemon API);
+        # each dataset is mounted at /data/<study>/<dataset>.
+        data_mounts = []
+        if study_runtime is not None:
+            data_mounts = study_runtime.datasets
+        elif should_mount_study_data(study):
+            study_data_file = os.path.join(self.WORKSPACE_MOUNT, self.STUDY_DATA_PATH_FILE)
+            study_data_map = load_study_data_file(study_data_file, logger=self.logger)
+            data_mounts = resolve_study_dataset_mounts(study_data_map, study, study_data_file, logger=self.logger)
+        for dataset_mount in data_mounts:
+            self.logger.info(
+                "mounting study '%s' dataset '%s' from %s -> %s",
+                study,
+                dataset_mount.dataset,
+                dataset_mount.source,
+                dataset_mount.mount_path,
+            )
+
+        self.logger.info(f"launching job {job_id} as container {container_name} using image {job_image}")
+
+        docker_client = self._get_docker_client()
+        try:
+            mounts = [
+                docker.types.Mount(
+                    target=self.WORKSPACE_MOUNT,
+                    source=None,
+                    type="tmpfs",
+                    read_only=False,
+                    tmpfs_mode=_WORKSPACE_TMPFS_MODE,
+                ),
+                docker.types.Mount(
+                    target=container_startup_dir,
+                    source=host_startup_dir,
+                    type="bind",
+                    read_only=True,
+                ),
+                docker.types.Mount(target=container_local_dir, source=host_local_dir, type="bind", read_only=True),
+                docker.types.Mount(
+                    target=container_job_workspace,
+                    source=host_job_workspace,
+                    type="bind",
+                    read_only=False,
+                ),
+            ]
+            for dataset_mount in data_mounts:
+                mounts.append(
+                    docker.types.Mount(
+                        target=dataset_mount.mount_path,
+                        source=dataset_mount.source,
+                        type="bind",
+                        read_only=dataset_mount.read_only,
+                    )
+                )
+            if file_parent_dir:
+                # The job cell must update leases and append its log, so read-write
+                mounts.append(
+                    docker.types.Mount(target=file_parent_dir, source=file_parent_dir, type="bind", read_only=False)
+                )
+            if study_runtime is not None:
+                for secret_mount in study_runtime.secret_mounts:
+                    mounts.append(
+                        docker.types.Mount(
+                            target=secret_mount.mount_path,
+                            source=secret_mount.source,
+                            type="bind",
+                            read_only=True,
+                        )
+                    )
+            container = docker_client.containers.run(
+                job_image,
+                command=command,
+                name=container_name,
+                network=self.network,
+                detach=True,
+                auto_remove=True,
+                environment=environment if environment else None,
+                mounts=mounts,
+                working_dir=container_job_workspace,
+                # Run as the same user as SP/CP so job-written files are accessible to SP/CP
+                # (e.g. cross_val_results.json written by SJ must be readable/deletable by SP).
+                # Never pass Docker socket to job containers.
+                user=f"{os.getuid()}:{os.getgid()}",
+                **merged_container_kwargs,
+            )
+        except docker.errors.ImageNotFound:
+            raise RuntimeError(f"image '{job_image}' not found for job {job_id}")
+        except docker.errors.APIError as e:
+            raise RuntimeError(f"error creating container for job {job_id}: {e}")
+
+        job_handle = DockerJobHandle(
+            container_id=container.id,
+            container_name=container_name,
+            docker_client=docker_client,
+            timeout=self.timeout,
+            container=container,
+            watch_exit=True,
+        )
+
+        try:
+            if not job_handle.enter_states([DockerStatus.RUNNING]):
+                self.logger.warning(f"container {container_name} did not reach RUNNING state for job {job_id}")
+        except BaseException:
+            job_handle.terminate()
+            raise
+
+        # Always return a handle — caller detects failure via poll()
+        return job_handle
+
+    def handle_event(self, event_type: str, fl_ctx: FLContext):
+        if event_type == EventType.BEFORE_JOB_LAUNCH:
+            add_launcher(self, fl_ctx)
+
+    @abstractmethod
+    def get_module_args(self, job_args: dict) -> dict:
+        """Return a {flag: value} dict of args to pass to the job module.
+
+        Args:
+            job_args: JOB_PROCESS_ARGS dict from FLContext (with PARENT_URL already overridden).
+
+        Returns:
+            dict of {flag: value} pairs to append after '-u -m <module>' in the container command.
+        """
+        pass
+
+
+class ClientDockerJobLauncher(DockerJobLauncher):
+    def get_module_args(self, job_args: dict) -> dict:
+        return _job_args_dict(job_args, get_client_job_args(include_exe_module=False, include_set_options=False))
+
+
+class ServerDockerJobLauncher(DockerJobLauncher):
+    def get_module_args(self, job_args: dict) -> dict:
+        return _job_args_dict(job_args, get_server_job_args(include_exe_module=False, include_set_options=False))

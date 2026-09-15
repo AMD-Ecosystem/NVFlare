@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel", "versioneer", "PyYAML>=6.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.isort]
+known_first_party = "nvflare"
+profile = "black"
+multi_line_output = 3
+line_length = 120
+skip = [".git", ".eggs", "venv", ".venv", "versioneer.py", "_version.py", "conf.py", "nvflare/__init__.py"]
+skip_glob = [ "*.pyi", "**/*_pb2*" ]
+
+[tool.black]
+line-length = 120
+target-version = ["py310", "py311", "py312", "py313", "py314"]
+include = '\.pyi?$'
+exclude = '''
+(
+  /(
+    # exclude a few common directories in the root of the project
+      \.eggs
+    | \.git
+    | \.hg
+    | \.mypy_cache
+    | \.tox
+    | \.venv
+    | \.pytype
+    | _build
+    | buck-out
+    | build
+    | dist
+  )/
+  | .pb2.
+  | _version.py
+)
+'''
+
+[tool.pytest.ini_options]
+markers = [
+    "timeout: mark tests with an execution time limit",
+    "slow: mark tests as slow-running (excluded from the default test run)",
+    "xdist_group(name): mark tests that must run on the same pytest-xdist worker",
+]

@@ -1,0 +1,158 @@
+********************
+Flower Job Structure
+********************
+Even though Flower Programming is out of the scope of FLARE/Flower integration, you need to have a good
+understanding of the Flower Job Structure when submitting to FLARE.
+
+A Flower job is a regular FLARE job with special requirements for the ``custom`` directory, as shown below.
+
+.. code-block:: none
+
+    ├── flwr_pt
+    │   ├── client.py   # <-- contains `ClientApp`
+    │   ├── __init__.py # <-- to register the python module
+    │   ├── server.py   # <-- contains `ServerApp`
+    │   └── task.py     # <-- task-specific code (model, data)
+    └── pyproject.toml  # <-- Flower project file
+
+Project Folder
+==============
+All Flower app code must be placed in a subfolder in the ``custom`` directory of the job. This subfolder is called
+the project folder of the app. In this example, the project folder is named ``flwr_pt``. Typically, this folder
+contains ``server.py``, ``client.py``, and the ``__init__.py``. Though you could organize them differently (see discussion
+below), we recommend always including the ``__init__.py`` so that the project folder is guaranteed to be a valid Python
+package, regardless of Python versions.
+
+Pyproject.toml
+--------------
+The ``pyproject.toml`` file exists in the job's ``custom`` folder. It is an important file that contains server and
+client app definition and configuration information. Such information is used by the Flower system to find the
+server app and the client app, and to pass app-specific configuration to the apps.
+
+Here is an example of ``pyproject.toml``, taken from :github_nvflare_link:`this example <examples/hello-world/hello-flower/flwr-pt/pyproject.toml>`.
+
+.. code-block:: toml
+
+    [build-system]
+    requires = ["hatchling"]
+    build-backend = "hatchling.build"
+
+    # Tested with:
+    #   flwr==1.27.0
+    #   nvflare==2.9.0rc1
+    #   torch==2.11.0
+    #   torchvision==0.26.0
+    #   tensorboard==2.20.0
+
+    [project]
+    name = "flwr-pt"
+    version = "1.0.0"
+    description = ""
+    license = "Apache-2.0"
+    dependencies = [
+        "flwr>=1.26",
+        "nvflare~=2.9.0rc",
+        "torch",
+        "torchvision",
+        "tensorboard"
+    ]
+
+    [tool.hatch.build.targets.wheel]
+    packages = ["."]
+
+    [tool.flwr.app]
+    publisher = "nvidia"
+
+    [tool.flwr.app.components]
+    serverapp = "flwr_pt.server:app"
+    clientapp = "flwr_pt.client:app"
+
+    [tool.flwr.app.config]
+    num-server-rounds = 3
+    learning-rate = 0.001
+    momentum = 0.9
+
+
+.. note:: Note that the information defined in pyproject.toml must match the code in the project folder!
+
+.. note:: For NVFlare-managed Flower jobs, NVFlare creates a job-scoped
+   ``$FLWR_HOME/config.toml`` with the SuperLink connection details. You do not
+   need to define a ``[tool.flwr.federations]`` section in ``pyproject.toml`` for
+   FLARE execution.
+
+.. note:: Flower 1.26+ support requires the NVFlare 2.9 release candidate line
+   (``nvflare~=2.9.0rc``), or NVFlare installed from current ``main``. If you
+   are using released NVFlare 2.7.x, use ``flwr>=1.16,<1.26`` and the 2.7 branch
+   or tag of the Flower examples.
+
+Project Name
+~~~~~~~~~~~~
+The project name should match the name of the project folder, though not a requirement. In this example, it is ``flwr_pt``. 
+Server App Specification
+
+This value is specified following this format:
+
+.. code-block::
+
+    <server_app_module>:<server_app_var_name>
+
+where:
+
+    - The <server_app_module> is the module that contains the server app code. This module is usually defined as ``server.py`` in the project folder (flwr_pt in this example). 
+    - The <server_app_var_name> is the name of the variable that holds the ServerApp object in the <server_app_module>. This variable is usually defined as ``app``:
+
+.. code-block:: python
+
+    app = ServerApp(server_fn=server_fn)
+
+
+Client App Specification
+~~~~~~~~~~~~~~~~~~~~~~~~
+This value is specified following this format:
+
+.. code-block::
+
+	<client_app_module>:<client_app_var_name>
+
+where:
+
+	- The <client_app_module> is the module that contains the client app code. This module is usually defined as ``client.py`` in the project folder (flwr_pt in this example). 
+	- The <client_app_var_name> is the name of the variable that holds the ClientApp object in the <client_app_module>. This variable is usually defined as ``app``:
+
+.. code-block:: python
+
+    app = ClientApp(client_fn=client_fn)
+
+
+App Configuration
+~~~~~~~~~~~~~~~~~
+The pyproject.toml file can contain app config information, in the ``[tool.flwr.app.config]`` section. In this example,
+it defines the number of rounds:
+
+.. code-block:: toml
+
+    [tool.flwr.app.config]
+    num-server-rounds = 3
+
+The content of this section is specific to the server app code. The ``server.py`` in the example shows how this is used:
+
+.. code-block:: python
+
+    def server_fn(context: Context):
+        # Read from config
+        num_rounds = context.run_config["num-server-rounds"]
+
+        # Define config
+        config = ServerConfig(num_rounds=num_rounds)
+
+        return ServerAppComponents(strategy=strategy, config=config)
+
+Note that you can also pass `run_config` arguments directly through the job definition via 
+`FlowerRecipe(..., run_config={"num-server-rounds": 5})` to override the default values listed in `pyproject.toml`.
+
+Simulation Profiles
+~~~~~~~~~~~~~~~~~~~
+If you run the Flower job directly with Flower simulation instead of submitting it
+as a FLARE job, configure the simulation profile using Flower's current simulation
+configuration mechanism. This is separate from the NVFlare execution path, where
+NVFlare manages the SuperLink connection through ``$FLWR_HOME/config.toml``.

@@ -1,0 +1,263 @@
+# Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import re
+from platform import python_version
+
+import pytest
+
+from nvflare.app_common.np.np_model_locator import NPModelLocator
+from nvflare.fuel.common.excepts import ConfigError
+from nvflare.fuel.utils.component_builder import ComponentBuilder
+from tests.unit_test.fuel.utils.mock_component_builder import MockComponentBuilder
+
+
+class MyComponent:
+    def __init__(self, model):
+        self.mode = model
+
+
+class MyComponentFailure:
+    def __init__(self):
+        raise RuntimeError("initialization failed")
+
+
+class MyComponentWithDictArgs:
+    def __init__(self, model: dict = None):
+        self.mode = model
+
+
+class MyComponentWithPathArgs:
+    def __init__(self, path: str = None):
+        self.path = path
+
+
+def is_python_greater_than_309():
+    major, minor, _ = python_version().split(".")
+    return (int(major), int(minor)) > (3, 9)
+
+
+class TestComponentBuilder:
+    def test_component_builder_is_abstract(self):
+        with pytest.raises(TypeError):
+            ComponentBuilder()
+
+    def test_empty_dict(self):
+        builder = MockComponentBuilder()
+        b = builder.build_component({})
+        assert b is None
+
+    def test_component(self):
+        """Backward compat: config with only 'path' (no class_path) works as before."""
+        config = {"id": "id", "path": "nvflare.app_common.np.np_model_locator.NPModelLocator", "args": {}}
+        builder = MockComponentBuilder()
+
+        assert isinstance(config, dict)
+        b = builder.build_component(config)
+        assert isinstance(b, NPModelLocator)
+
+    def test_component_with_name_only(self):
+        """Backward compat: config with only 'name' (short name) still resolves via module scanner."""
+        config = {"id": "id", "name": "NPModelLocator", "args": {}}
+        builder = MockComponentBuilder()
+        b = builder.build_component(config)
+        assert isinstance(b, NPModelLocator)
+
+    def test_component_with_class_path(self):
+        """Component config can use 'class_path' instead of 'path' for job API consistency."""
+        config = {
+            "id": "id",
+            "class_path": "nvflare.app_common.np.np_model_locator.NPModelLocator",
+            "args": {},
+        }
+        builder = MockComponentBuilder()
+        b = builder.build_component(config)
+        assert isinstance(b, NPModelLocator)
+
+    def test_component_path_takes_precedence_over_class_path(self):
+        """When both 'path' and 'class_path' are present, 'path' is used."""
+        config = {
+            "id": "id",
+            "path": "nvflare.app_common.np.np_model_locator.NPModelLocator",
+            "class_path": "tests.unit_test.fuel.utils.component_builder_test.MyComponentWithDictArgs",
+            "args": {},
+        }
+        builder = MockComponentBuilder()
+        b = builder.build_component(config)
+        assert isinstance(b, NPModelLocator)
+
+    def test_empty_path_raises_even_when_class_path_present(self):
+        """Empty 'path' is validated and raises ConfigError; we do not silently use class_path."""
+        config = {
+            "path": "",
+            "class_path": "nvflare.app_common.np.np_model_locator.NPModelLocator",
+            "args": {},
+        }
+        builder = MockComponentBuilder()
+        with pytest.raises(ConfigError, match="path spec must not be empty"):
+            builder.build_component(config)
+
+    def test_component_failure(self):
+        config = {"id": "id", "path": "nvflare.app_common.np.np_model_locator.NPModelLocator", "args": {"xyz": 1}}
+        builder = MockComponentBuilder()
+
+        # the failure message changes since 3.10
+        if is_python_greater_than_309():
+            msg = "Class nvflare.app_common.np.np_model_locator.NPModelLocator has parameters error: TypeError: NPModelLocator.__init__() got an unexpected keyword argument 'xyz'."
+        else:
+            msg = "Class nvflare.app_common.np.np_model_locator.NPModelLocator has parameters error: TypeError: __init__() got an unexpected keyword argument 'xyz'."
+
+        assert isinstance(config, dict)
+        b = None
+        with pytest.raises(ValueError, match=re.escape(msg)):
+            b = builder.build_component(config)
+
+    def test_component_init_failure(self):
+        config = {
+            "id": "id",
+            "path": "tests.unit_test.fuel.utils.component_builder_test.MyComponentFailure",
+            "args": {},
+        }
+        builder = MockComponentBuilder()
+        assert isinstance(config, dict)
+        with pytest.raises(RuntimeError, match="initialization failed"):
+            builder.build_component(config)
+
+    def test_embedded_component(self):
+        config = {
+            "id": "id",
+            "path": "tests.unit_test.fuel.utils.component_builder_test.MyComponent",
+            "args": {"model": {"path": "nvflare.app_common.np.np_model_locator.NPModelLocator", "args": {}}},
+        }
+        builder = MockComponentBuilder()
+        assert isinstance(config, dict)
+        b = builder.build_component(config)
+        assert isinstance(b, MyComponent)
+
+    def test_embedded_component_with_dict_args(self):
+        config = {
+            "id": "id",
+            "path": "tests.unit_test.fuel.utils.component_builder_test.MyComponent",
+            "args": {
+                "model": {
+                    "path": "tests.unit_test.fuel.utils.component_builder_test.MyComponentWithDictArgs",
+                    "args": {"model": {"a": "b"}},
+                }
+            },
+        }
+        builder = MockComponentBuilder()
+        assert isinstance(config, dict)
+        b = builder.build_component(config)
+        assert isinstance(b, MyComponent)
+        assert isinstance(b.mode, MyComponentWithDictArgs)
+        assert b.mode.mode == {"a": "b"}
+
+    def test_embedded_component_failure(self):
+        config = {
+            "id": "id",
+            "path": "tests.unit_test.fuel.utils.component_builder_test.MyComponent",
+            "args": {"model": {"path": "nvflare.app_common.np.np_model_locator.NPModelLocator", "args": {"abc": 1}}},
+        }
+
+        # the failure message changes since 3.10
+        if is_python_greater_than_309():
+            msg = "failed to instantiate class: ValueError: Class nvflare.app_common.np.np_model_locator.NPModelLocator has parameters error: TypeError: NPModelLocator.__init__() got an unexpected keyword argument 'abc'."
+        else:
+            msg = "failed to instantiate class: ValueError: Class nvflare.app_common.np.np_model_locator.NPModelLocator has parameters error: TypeError: __init__() got an unexpected keyword argument 'abc'."
+
+        builder = MockComponentBuilder()
+        assert isinstance(config, dict)
+
+        with pytest.raises(
+            ValueError,
+            match=re.escape(msg),
+        ):
+            b = builder.build_component(config)
+
+    def test_component_wo_args(self):
+        config = {"id": "id", "path": "tests.unit_test.fuel.utils.component_builder_test.MyComponentWithDictArgs"}
+        builder = MockComponentBuilder()
+        assert isinstance(config, dict)
+        b = builder.build_component(config)
+        assert isinstance(b, MyComponentWithDictArgs)
+
+    def test_embedded_component_wo_args(self):
+        config = {
+            "id": "id",
+            "path": "tests.unit_test.fuel.utils.component_builder_test.MyComponent",
+            "args": {
+                "model": {
+                    "path": "tests.unit_test.fuel.utils.component_builder_test.MyComponentWithDictArgs",
+                }
+            },
+        }
+        builder = MockComponentBuilder()
+        assert isinstance(config, dict)
+        b = builder.build_component(config)
+        assert isinstance(b, MyComponent)
+        assert isinstance(b.mode, MyComponentWithDictArgs)
+
+    def test_embedded_component_with_path_args(self):
+        config = {
+            "id": "id",
+            "path": "tests.unit_test.fuel.utils.component_builder_test.MyComponent",
+            "args": {
+                "model": {
+                    "path": "tests.unit_test.fuel.utils.component_builder_test.MyComponentWithPathArgs",
+                    "args": {"path": "/tmp/nvflare"},
+                }
+            },
+        }
+        builder = MockComponentBuilder()
+        assert isinstance(config, dict)
+        b = builder.build_component(config)
+        assert isinstance(b, MyComponent)
+        assert isinstance(b.mode, MyComponentWithPathArgs)
+
+    def test_nested_component_component_type(self):
+        config = {
+            "id": "id",
+            "path": "tests.unit_test.fuel.utils.component_builder_test.MyComponent",
+            "args": {
+                "model": {
+                    "path": "tests.unit_test.fuel.utils.component_builder_test.MyComponentWithDictArgs",
+                    "config_type": "component",
+                }
+            },
+        }
+        builder = MockComponentBuilder()
+        assert isinstance(config, dict)
+        b = builder.build_component(config)
+        assert isinstance(b, MyComponent)
+        assert isinstance(b.mode, MyComponentWithDictArgs)
+
+    def test_nested_dict_component_type(self):
+        config = {
+            "id": "id",
+            "path": "tests.unit_test.fuel.utils.component_builder_test.MyComponent",
+            "args": {
+                "model": {
+                    "path": "tests.unit_test.fuel.utils.component_builder_test.MyComponentWithDictArgs",
+                    "config_type": "dict",
+                }
+            },
+        }
+        builder = MockComponentBuilder()
+        assert isinstance(config, dict)
+        b = builder.build_component(config)
+        assert isinstance(b, MyComponent)
+        assert b.mode == {
+            "path": "tests.unit_test.fuel.utils.component_builder_test.MyComponentWithDictArgs",
+            "config_type": "dict",
+        }

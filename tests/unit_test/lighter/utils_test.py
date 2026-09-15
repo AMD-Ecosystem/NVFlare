@@ -1,0 +1,668 @@
+# Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import datetime
+import io
+import ipaddress
+import json
+import os
+import shutil
+import tempfile
+from unittest.mock import patch
+
+import pytest
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import dsa, ec, ed25519, rsa
+from cryptography.x509.oid import NameOID
+
+import nvflare.lighter.utils as lighter_utils
+from nvflare.lighter.impl.cert import serialize_cert
+from nvflare.lighter.tool_consts import NVFLARE_SIG_FILE
+from nvflare.lighter.utils import Identity, cert_to_dict
+from nvflare.lighter.utils import generate_cert as lighter_generate_cert
+from nvflare.lighter.utils import (
+    load_private_key_file,
+    load_yaml,
+    sign_folders,
+    verify_cert,
+    verify_folder_signature,
+    verify_folder_signature_and_get_signers,
+)
+
+folders = ["folder1", "folder2"]
+files = ["file1", "file2"]
+
+
+def _signing_algorithm(private_key):
+    if isinstance(private_key, ed25519.Ed25519PrivateKey):
+        return None
+    return hashes.SHA256()
+
+
+def generate_cert(subject, subject_org, issuer, signing_pri_key, subject_pub_key, valid_days=360, ca=False):
+    def _x509_name(cn_name, org_name):
+        name = [
+            x509.NameAttribute(NameOID.COMMON_NAME, cn_name),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, org_name),
+        ]
+        return x509.Name(name)
+
+    x509_subject = _x509_name(subject, subject_org)
+    x509_issuer = _x509_name(issuer, subject_org)
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(x509_subject)
+        .issuer_name(x509_issuer)
+        .public_key(subject_pub_key)
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
+        .not_valid_after(
+            # Our certificate will be valid for 360 days
+            datetime.datetime.now(datetime.timezone.utc)
+            + datetime.timedelta(days=valid_days)
+            # Sign our certificate with our private key
+        )
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(subject_pub_key),
+            critical=False,
+        )
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(signing_pri_key.public_key()),
+            critical=False,
+        )
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName(subject)]), critical=False)
+    )
+    if ca:
+        builder = builder.add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True).add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=True,
+                crl_sign=True,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+    return builder.sign(signing_pri_key, _signing_algorithm(signing_pri_key), default_backend())
+
+
+def get_test_certs():
+    root_pri_key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
+    root_pub_key = root_pri_key.public_key()
+    root_cert = lighter_generate_cert(
+        subject=Identity("root", "nvidia"),
+        issuer=Identity("root", "nvidia"),
+        signing_pri_key=root_pri_key,
+        subject_pub_key=root_pub_key,
+        ca=True,
+    )
+
+    client_pri_key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
+    client_pub_key = client_pri_key.public_key()
+    client_cert = lighter_generate_cert(
+        subject=Identity("client", "nvidia", "lead"),
+        issuer=Identity("root", "nvidia"),
+        signing_pri_key=root_pri_key,
+        subject_pub_key=client_pub_key,
+    )
+
+    server_pri_key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
+    server_pub_key = server_pri_key.public_key()
+    server_cert = lighter_generate_cert(
+        subject=Identity("server", "nvidia", "lead"),
+        issuer=Identity("root", "nvidia"),
+        signing_pri_key=root_pri_key,
+        subject_pub_key=server_pub_key,
+    )
+    return root_cert, client_pri_key, client_cert, server_pri_key, server_cert
+
+
+@pytest.mark.parametrize(
+    "root_key_factory",
+    [
+        lambda: rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend()),
+        lambda: ec.generate_private_key(ec.SECP256R1(), backend=default_backend()),
+        lambda: dsa.generate_private_key(key_size=2048, backend=default_backend()),
+        ed25519.Ed25519PrivateKey.generate,
+    ],
+    ids=["rsa", "ec", "dsa", "ed25519"],
+)
+def test_verify_cert_accepts_supported_issuer_key_types(root_key_factory):
+    root_pri_key = root_key_factory()
+    root_cert = generate_cert("root", "nvidia", "root", root_pri_key, root_pri_key.public_key(), ca=True)
+    leaf_pri_key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
+    leaf_cert = generate_cert("client", "nvidia", "root", root_pri_key, leaf_pri_key.public_key())
+
+    verify_cert(leaf_cert, root_cert.public_key())
+
+
+def test_verify_cert_chain_requires_leaf_cert():
+    root_cert, *_ = get_test_certs()
+
+    with pytest.raises(ValueError, match="leaf_cert is required"):
+        lighter_utils.verify_cert_chain(None, [], root_cert)
+
+
+def test_cert_to_dict_serial_number_is_hex_string():
+    root_cert, *_ = get_test_certs()
+
+    cert_dict = cert_to_dict(root_cert)
+
+    assert isinstance(cert_dict["serial_number"], str)
+    assert cert_dict["serial_number"].startswith("0x")
+
+
+def test_generate_cert_ca_key_usage_is_restricted():
+    root_pri_key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
+    root_pub_key = root_pri_key.public_key()
+
+    cert = lighter_generate_cert(
+        subject=Identity("root", "nvidia"),
+        issuer=Identity("root", "nvidia"),
+        signing_pri_key=root_pri_key,
+        subject_pub_key=root_pub_key,
+        ca=True,
+    )
+
+    key_usage = cert.extensions.get_extension_for_class(x509.KeyUsage).value
+    key_usage_ext = cert.extensions.get_extension_for_class(x509.KeyUsage)
+    assert key_usage_ext.critical is True
+    assert key_usage.key_cert_sign is True
+    assert key_usage.crl_sign is True
+    assert key_usage.digital_signature is True
+    assert key_usage.content_commitment is False
+    assert key_usage.key_encipherment is False
+    assert key_usage.data_encipherment is False
+    assert key_usage.key_agreement is False
+
+
+def test_generate_cert_rejects_reserved_extra_extensions():
+    root_pri_key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
+    subject_pri_key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
+
+    with pytest.raises(ValueError, match="reserved extension OID"):
+        lighter_generate_cert(
+            subject=Identity("client", "nvidia"),
+            issuer=Identity("root", "nvidia"),
+            signing_pri_key=root_pri_key,
+            subject_pub_key=subject_pri_key.public_key(),
+            extra_extensions=[(x509.SubjectAlternativeName([x509.DNSName("client")]), False)],
+        )
+
+
+def test_generate_cert_rejects_duplicate_extra_extensions():
+    root_pri_key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
+    subject_pri_key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
+    eku = x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.CLIENT_AUTH])
+
+    with pytest.raises(ValueError, match="duplicate extra extension OID"):
+        lighter_generate_cert(
+            subject=Identity("client", "nvidia"),
+            issuer=Identity("root", "nvidia"),
+            signing_pri_key=root_pri_key,
+            subject_pub_key=subject_pri_key.public_key(),
+            extra_extensions=[(eku, False), (eku, False)],
+        )
+
+
+def create_folder():
+    tmp_dir = tempfile.TemporaryDirectory().name
+    for folder in folders:
+        os.makedirs(os.path.join(tmp_dir, folder))
+        for file in files:
+            with open(os.path.join(tmp_dir, folder, file), "wb") as f:
+                f.write(open("/dev/urandom", "rb").read(1024))
+
+    return tmp_dir
+
+
+def tamper_one_file(folder):
+    with open(os.path.join(folder, folders[0], files[0]), "wt") as f:
+        f.write("fail case")
+
+
+def update_and_sign_one_folder(folder, pri_key, cert):
+    tmp_dir = tempfile.TemporaryDirectory().name
+    new_folder = os.path.join(tmp_dir, "new_folder")
+    shutil.move(folder, new_folder)
+    with open(os.path.join(tmp_dir, "test_file"), "wt") as f:
+        f.write("fail case")
+    with open("server.crt", "wb") as f:
+        f.write(serialize_cert(cert))
+    sign_folders(tmp_dir, pri_key, "server.crt", max_depth=1)
+    return tmp_dir
+
+
+def prepare_folders():
+    root_cert, client_pri_key, client_cert, server_pri_key, server_cert = get_test_certs()
+    folder = create_folder()
+    with open("client.crt", "wb") as f:
+        f.write(serialize_cert(client_cert))
+    with open("root.crt", "wb") as f:
+        f.write(serialize_cert(root_cert))
+    sign_folders(folder, client_pri_key, "client.crt")
+    return folder, server_pri_key, server_cert
+
+
+@pytest.mark.xdist_group(name="lighter_utils_group")
+class TestSignFolder:
+    def test_verify_folder(self):
+        folder, server_pri_key, server_cert = prepare_folders()
+        assert verify_folder_signature(folder, "root.crt") is True
+        tamper_one_file(folder)
+        assert verify_folder_signature(folder, "root.crt") is False
+        os.unlink("client.crt")
+        os.unlink("root.crt")
+        shutil.rmtree(folder)
+
+    def test_verify_updated_folder(self):
+        folder, server_pri_key, server_cert = prepare_folders()
+        assert verify_folder_signature(folder, "root.crt") is True
+        folder = update_and_sign_one_folder(folder, server_pri_key, server_cert)
+        assert verify_folder_signature(folder, "root.crt") is True
+        os.unlink("client.crt")
+        os.unlink("root.crt")
+        shutil.rmtree(folder)
+
+    def _get_participant(self, name, participants):
+        for p in participants:
+            if p.get("name") == name:
+                return p
+
+    def test_load_yaml(self):
+        dir_path = os.path.dirname(os.path.realpath(__file__))
+        data = load_yaml(os.path.join(dir_path, "0.yml"))
+
+        assert data.get("server_name") == "server"
+
+        participant = self._get_participant("server", data.get("participants"))
+        assert participant.get("server_name") == "server"
+        assert participant.get("extra").get("gpus") == "large"
+
+        participant = self._get_participant("client", data.get("participants"))
+        assert participant.get("client_name") == "client-1"
+
+
+@pytest.mark.xdist_group(name="lighter_utils_group")
+class TestVerifyFolderSignature:
+    """Unit tests for verify_folder_signature."""
+
+    def _setup_certs_and_folder(self, tmp_path):
+        """Create root CA, client cert, a folder with files, and return paths/keys."""
+        root_cert, client_pri_key, client_cert, _server_pri_key, _server_cert = get_test_certs()
+        root_ca_path = tmp_path / "root.crt"
+        client_crt_path = tmp_path / "client.crt"
+        root_ca_path.write_bytes(serialize_cert(root_cert))
+        client_crt_path.write_bytes(serialize_cert(client_cert))
+
+        folder = tmp_path / "signed_folder"
+        folder.mkdir()
+        (folder / "subdir").mkdir()
+        (folder / "file1.txt").write_bytes(b"content one")
+        (folder / "file2.bin").write_bytes(b"content two")
+        (folder / "subdir" / "nested.txt").write_bytes(b"nested content")
+
+        return str(folder), str(root_ca_path), str(client_crt_path), client_pri_key, client_cert
+
+    def test_verify_folder_signature_success_with_submitter_cert(self, tmp_path):
+        """Verify returns True when folder is signed with per-folder submitter cert (single_signer=False)."""
+        folder, root_ca_path, client_crt_path, client_pri_key, _ = self._setup_certs_and_folder(tmp_path)
+        sign_folders(folder, client_pri_key, crt_path=client_crt_path)
+        assert verify_folder_signature(folder, root_ca_path, single_signer=False) is True
+
+    def test_verify_folder_signature_returns_signer_identity(self, tmp_path):
+        """Verifier exposes the trusted submitter identity from the signing cert."""
+        root_pri_key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
+        root_pub_key = root_pri_key.public_key()
+        root_cert = lighter_generate_cert(
+            subject=Identity("root", "nvidia"),
+            issuer=Identity("root", "nvidia"),
+            signing_pri_key=root_pri_key,
+            subject_pub_key=root_pub_key,
+            ca=True,
+        )
+
+        signer_pri_key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
+        signer_pub_key = signer_pri_key.public_key()
+        signer_cert = lighter_generate_cert(
+            subject=Identity("alice@nvidia.com", "nvidia", "lead"),
+            issuer=Identity("root", "nvidia"),
+            signing_pri_key=root_pri_key,
+            subject_pub_key=signer_pub_key,
+        )
+
+        root_ca_path = tmp_path / "root.crt"
+        signer_crt_path = tmp_path / "alice.crt"
+        root_ca_path.write_bytes(serialize_cert(root_cert))
+        signer_crt_path.write_bytes(serialize_cert(signer_cert))
+
+        folder = tmp_path / "signed_folder"
+        folder.mkdir()
+        (folder / "config.json").write_bytes(b"{}")
+        sign_folders(str(folder), signer_pri_key, crt_path=str(signer_crt_path))
+
+        verified, signers = verify_folder_signature_and_get_signers(str(folder), str(root_ca_path))
+
+        assert verified is True
+        assert len(signers) == 1
+        assert signers[0] == ("alice@nvidia.com", "nvidia", "lead")
+
+    def test_verify_folder_signature_success_single_signer(self, tmp_path):
+        """Verify returns True when folder is signed by root key only (single_signer=True)."""
+        root_pri_key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
+        root_pub_key = root_pri_key.public_key()
+        root_cert = generate_cert("root", "nvidia", "root", root_pri_key, root_pub_key, ca=True)
+        root_ca_path = tmp_path / "root.crt"
+        root_ca_path.write_bytes(serialize_cert(root_cert))
+
+        folder = tmp_path / "single_signer_folder"
+        folder.mkdir()
+        (folder / "data.txt").write_bytes(b"data")
+        sign_folders(folder, root_pri_key, crt_path=None)
+
+        assert verify_folder_signature(folder, str(root_ca_path), single_signer=True) is True
+
+    def test_verify_folder_signature_fails_when_file_tampered(self, tmp_path):
+        """Verify returns False when a file is modified after signing."""
+        folder, root_ca_path, client_crt_path, client_pri_key, _ = self._setup_certs_and_folder(tmp_path)
+        sign_folders(folder, client_pri_key, crt_path=client_crt_path)
+        with open(os.path.join(folder, "file1.txt"), "wb") as f:
+            f.write(b"tampered content")
+        assert verify_folder_signature(folder, root_ca_path, single_signer=False) is False
+
+    def test_verify_folder_signature_fails_when_subdirectory_replaced_by_symlink(self, tmp_path):
+        folder, root_ca_path, client_crt_path, client_pri_key, _ = self._setup_certs_and_folder(tmp_path)
+        sign_folders(folder, client_pri_key, crt_path=client_crt_path)
+
+        replacement = tmp_path / "replacement"
+        replacement.mkdir()
+        (replacement / "nested.txt").write_bytes(b"tampered content")
+        subdir = os.path.join(folder, "subdir")
+        shutil.rmtree(subdir)
+        os.symlink(replacement, subdir, target_is_directory=True)
+
+        assert verify_folder_signature(folder, root_ca_path, single_signer=False) is False
+
+    def test_sign_folders_rejects_symlinks(self, tmp_path):
+        folder, _root_ca_path, _client_crt_path, client_pri_key, _ = self._setup_certs_and_folder(tmp_path)
+        target = tmp_path / "target.txt"
+        target.write_bytes(b"content")
+        os.symlink(target, os.path.join(folder, "link.txt"))
+
+        with pytest.raises(ValueError, match="symbolic links are not allowed"):
+            sign_folders(folder, client_pri_key)
+
+    def test_sign_and_verify_reject_symlinked_root(self, tmp_path):
+        folder, root_ca_path, client_crt_path, client_pri_key, _ = self._setup_certs_and_folder(tmp_path)
+        sign_folders(folder, client_pri_key, crt_path=client_crt_path)
+        real_folder = tmp_path / "real_folder"
+        os.rename(folder, real_folder)
+        os.symlink(real_folder, folder, target_is_directory=True)
+
+        with pytest.raises(ValueError, match="signed folder must not be a symbolic link"):
+            sign_folders(folder, client_pri_key)
+        assert verify_folder_signature(folder, root_ca_path, single_signer=False) is False
+
+    def test_verify_folder_signature_fails_when_signature_file_missing(self, tmp_path):
+        """Verify returns False when a directory has no signature file."""
+        folder, root_ca_path, client_crt_path, client_pri_key, _ = self._setup_certs_and_folder(tmp_path)
+        sign_folders(folder, client_pri_key, crt_path=client_crt_path)
+        os.unlink(os.path.join(folder, "subdir", NVFLARE_SIG_FILE))
+        assert verify_folder_signature(folder, root_ca_path, single_signer=False) is False
+
+    def test_verify_folder_signature_fails_when_root_ca_path_invalid(self, tmp_path):
+        """Verify returns False when root_ca_path does not exist or is invalid."""
+        folder, _root_ca_path, client_crt_path, client_pri_key, _ = self._setup_certs_and_folder(tmp_path)
+        sign_folders(folder, client_pri_key, crt_path=client_crt_path)
+        assert verify_folder_signature(folder, str(tmp_path / "nonexistent.crt"), single_signer=False) is False
+        assert verify_folder_signature(folder, str(tmp_path / "root.crt") + ".missing", single_signer=False) is False
+
+    def test_verify_folder_signature_fails_when_file_signature_missing(self, tmp_path):
+        """Verify returns False when a file has no entry in the signature JSON."""
+        folder, root_ca_path, client_crt_path, client_pri_key, _ = self._setup_certs_and_folder(tmp_path)
+        sign_folders(folder, client_pri_key, crt_path=client_crt_path)
+        sig_path = os.path.join(folder, NVFLARE_SIG_FILE)
+        with open(sig_path, "rt") as f:
+            sigs = json.load(f)
+        del sigs["file1.txt"]
+        with open(sig_path, "wt") as f:
+            json.dump(sigs, f)
+        assert verify_folder_signature(folder, root_ca_path, single_signer=False) is False
+
+    def test_verify_folder_signature_fails_when_subfolder_signature_missing(self, tmp_path):
+        """Verify returns False when a subfolder has no signature in the JSON."""
+        folder, root_ca_path, client_crt_path, client_pri_key, _ = self._setup_certs_and_folder(tmp_path)
+        sign_folders(folder, client_pri_key, crt_path=client_crt_path)
+        sig_path = os.path.join(folder, NVFLARE_SIG_FILE)
+        with open(sig_path, "rt") as f:
+            sigs = json.load(f)
+        del sigs["subdir"]
+        with open(sig_path, "wt") as f:
+            json.dump(sigs, f)
+        assert verify_folder_signature(folder, root_ca_path, single_signer=False) is False
+
+    def test_verify_folder_signature_fails_when_single_signer_but_submitter_cert_expected(self, tmp_path):
+        """Verify returns False when single_signer=False but a directory has no submitter cert."""
+        root_pri_key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
+        root_pub_key = root_pri_key.public_key()
+        root_cert = generate_cert("root", "nvidia", "root", root_pri_key, root_pub_key, ca=True)
+        root_ca_path = tmp_path / "root.crt"
+        root_ca_path.write_bytes(serialize_cert(root_cert))
+
+        folder = tmp_path / "no_submitter"
+        folder.mkdir()
+        (folder / "f.txt").write_bytes(b"x")
+        sign_folders(folder, root_pri_key, crt_path=None)
+        # single_signer=False expects NVFLARE_SUBMITTER_CRT_FILE in each dir -> not present -> fails
+        assert verify_folder_signature(folder, str(root_ca_path), single_signer=False) is False
+
+    def test_verify_folder_signature_with_custom_signature_file(self, tmp_path):
+        """Verify works with a custom signature_file name."""
+        custom_sig_file = "custom_sig.json"
+        folder, root_ca_path, client_crt_path, client_pri_key, _ = self._setup_certs_and_folder(tmp_path)
+        sign_folders(folder, client_pri_key, crt_path=client_crt_path, signature_file=custom_sig_file)
+        assert (
+            verify_folder_signature(folder, root_ca_path, single_signer=False, signature_file=custom_sig_file) is True
+        )
+
+    def test_verify_folder_signature_rejects_expired_submitter_cert(self, tmp_path):
+        root_pri_key, root_pub_key = lighter_utils.generate_keys()
+        client_pri_key, client_pub_key = lighter_utils.generate_keys()
+        root_cert = lighter_generate_cert(
+            subject=Identity("root", "nvidia"),
+            issuer=Identity("root", "nvidia"),
+            signing_pri_key=root_pri_key,
+            subject_pub_key=root_pub_key,
+            ca=True,
+        )
+        now = datetime.datetime.now(datetime.timezone.utc)
+        client_cert = lighter_generate_cert(
+            subject=Identity("client", "nvidia", "lead"),
+            issuer=Identity("root", "nvidia"),
+            signing_pri_key=root_pri_key,
+            subject_pub_key=client_pub_key,
+            not_valid_before=now - datetime.timedelta(days=2),
+            not_valid_after=now - datetime.timedelta(days=1),
+        )
+        root_ca_path = tmp_path / "root.crt"
+        client_crt_path = tmp_path / "client.crt"
+        root_ca_path.write_bytes(serialize_cert(root_cert))
+        client_crt_path.write_bytes(serialize_cert(client_cert))
+        folder = tmp_path / "signed_folder"
+        folder.mkdir()
+        (folder / "file.txt").write_bytes(b"content")
+
+        sign_folders(str(folder), client_pri_key, crt_path=str(client_crt_path))
+
+        assert verify_folder_signature(str(folder), str(root_ca_path), single_signer=False) is False
+
+    def test_verify_folder_signature_rejects_submitter_ca_cert(self, tmp_path):
+        root_pri_key, root_pub_key = lighter_utils.generate_keys()
+        client_pri_key, client_pub_key = lighter_utils.generate_keys()
+        root_cert = lighter_generate_cert(
+            subject=Identity("root", "nvidia"),
+            issuer=Identity("root", "nvidia"),
+            signing_pri_key=root_pri_key,
+            subject_pub_key=root_pub_key,
+            ca=True,
+        )
+        client_cert = lighter_generate_cert(
+            subject=Identity("client", "nvidia", "lead"),
+            issuer=Identity("root", "nvidia"),
+            signing_pri_key=root_pri_key,
+            subject_pub_key=client_pub_key,
+            ca=True,
+        )
+        root_ca_path = tmp_path / "root.crt"
+        client_crt_path = tmp_path / "client.crt"
+        root_ca_path.write_bytes(serialize_cert(root_cert))
+        client_crt_path.write_bytes(serialize_cert(client_cert))
+        folder = tmp_path / "signed_folder"
+        folder.mkdir()
+        (folder / "file.txt").write_bytes(b"content")
+
+        sign_folders(str(folder), client_pri_key, crt_path=str(client_crt_path))
+
+        assert verify_folder_signature(str(folder), str(root_ca_path), single_signer=False) is False
+
+    def test_verify_folder_signature_accepts_submitter_cert_with_custom_role(self, tmp_path):
+        root_pri_key, root_pub_key = lighter_utils.generate_keys()
+        client_pri_key, client_pub_key = lighter_utils.generate_keys()
+        root_cert = lighter_generate_cert(
+            subject=Identity("root", "nvidia"),
+            issuer=Identity("root", "nvidia"),
+            signing_pri_key=root_pri_key,
+            subject_pub_key=root_pub_key,
+            ca=True,
+        )
+        client_cert = lighter_generate_cert(
+            subject=Identity("client", "nvidia", "self_defined"),
+            issuer=Identity("root", "nvidia"),
+            signing_pri_key=root_pri_key,
+            subject_pub_key=client_pub_key,
+        )
+        root_ca_path = tmp_path / "root.crt"
+        client_crt_path = tmp_path / "client.crt"
+        root_ca_path.write_bytes(serialize_cert(root_cert))
+        client_crt_path.write_bytes(serialize_cert(client_cert))
+        folder = tmp_path / "signed_folder"
+        folder.mkdir()
+        (folder / "file.txt").write_bytes(b"content")
+
+        sign_folders(str(folder), client_pri_key, crt_path=str(client_crt_path))
+
+        verified, signers = verify_folder_signature_and_get_signers(str(folder), str(root_ca_path), single_signer=False)
+
+        assert verified is True
+        assert signers == [("client", "nvidia", "self_defined")]
+
+
+@pytest.mark.xdist_group(name="lighter_utils_group")
+class TestGenerateCert:
+    def test_generate_cert_uses_ip_address_san_for_raw_ip(self):
+        root_pri_key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
+        server_pri_key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
+        server_pub_key = server_pri_key.public_key()
+
+        cert = lighter_generate_cert(
+            subject=Identity("server", "nvidia"),
+            issuer=Identity("root", "nvidia"),
+            signing_pri_key=root_pri_key,
+            subject_pub_key=server_pub_key,
+            server_default_host="34.118.10.20",
+        )
+
+        sans = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+
+        assert sans.get_values_for_type(x509.IPAddress) == [ipaddress.ip_address("34.118.10.20")]
+        assert sans.get_values_for_type(x509.DNSName) == []
+
+    def test_generate_cert_supports_mixed_dns_and_ip_subject_alt_names(self):
+        root_pri_key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
+        server_pri_key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
+        server_pub_key = server_pri_key.public_key()
+
+        cert = lighter_generate_cert(
+            subject=Identity("server", "nvidia"),
+            issuer=Identity("root", "nvidia"),
+            signing_pri_key=root_pri_key,
+            subject_pub_key=server_pub_key,
+            server_default_host="34.118.10.20",
+            server_additional_hosts=["server.example.com"],
+        )
+
+        sans = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+
+        assert sans.get_values_for_type(x509.IPAddress) == [ipaddress.ip_address("34.118.10.20")]
+        assert sans.get_values_for_type(x509.DNSName) == ["server.example.com"]
+
+    def test_generate_cert_uses_timezone_aware_now(self, monkeypatch):
+        original_datetime = lighter_utils.datetime.datetime
+
+        class _DateTime(original_datetime):
+            @classmethod
+            def utcnow(cls):
+                raise AssertionError("generate_cert should not call utcnow()")
+
+        monkeypatch.setattr(lighter_utils.datetime, "datetime", _DateTime)
+
+        root_pri_key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
+        server_pri_key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
+        server_pub_key = server_pri_key.public_key()
+
+        cert = lighter_generate_cert(
+            subject=Identity("server", "nvidia"),
+            issuer=Identity("root", "nvidia"),
+            signing_pri_key=root_pri_key,
+            subject_pub_key=server_pub_key,
+        )
+
+        assert cert is not None
+
+
+def test_load_private_key_file_reads_bytes():
+    pem_data = b"-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n"
+    sentinel_key = object()
+    open_calls = []
+
+    def _open(file_path, mode="r", *args, **kwargs):
+        open_calls.append((file_path, mode))
+        return io.BytesIO(pem_data)
+
+    with patch("builtins.open", _open):
+        with patch.object(lighter_utils.serialization, "load_pem_private_key", return_value=sentinel_key) as loader:
+            key = load_private_key_file("test.key")
+
+    assert open_calls == [("test.key", "rb")]
+    loader.assert_called_once_with(pem_data, password=None, backend=default_backend())
+    assert key is sentinel_key
+
+
+def test_load_yaml_include_rejects_path_traversal(tmp_path):
+    outside = tmp_path / "outside.yml"
+    outside.write_text("leak: true\n")
+
+    root = tmp_path / "root"
+    root.mkdir()
+    config = root / "config.yml"
+    config.write_text("include: ../outside.yml\n")
+
+    with pytest.raises(ValueError, match="include path escapes root"):
+        load_yaml(config)

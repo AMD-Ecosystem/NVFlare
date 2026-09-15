@@ -1,0 +1,364 @@
+# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import json
+import os
+import tempfile
+from unittest.mock import patch
+
+import pytest
+
+from nvflare.apis.fl_constant import ConfigVarName
+from nvflare.app_common.abstract.model_learner import _MODEL_LEARNER_DEPRECATION_MSG, ModelLearner
+from nvflare.app_common.executors.client_api_executor import ClientAPIExecutor
+from nvflare.app_common.executors.model_learner_executor import ModelLearnerExecutor
+from nvflare.app_common.workflows.fedavg import FedAvg
+from nvflare.fuel.utils.deprecated import _WARNED_DEPRECATION_MESSAGES
+from nvflare.job_config.api import FedApp, FedJob
+from nvflare.job_config.fed_app_config import ClientAppConfig
+
+
+def _create_model_learner():
+    _WARNED_DEPRECATION_MESSAGES.discard(_MODEL_LEARNER_DEPRECATION_MSG)
+    with pytest.warns(DeprecationWarning, match="ModelLearner is deprecated"):
+        return ModelLearner()
+
+
+class TestFedJob:
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "",
+            " ",
+            ".",
+            "..",
+            "../job",
+            "nested/job",
+            "/tmp/job",
+            r"..\evil",
+            "job name",
+        ],
+    )
+    def test_rejects_invalid_job_name(self, name):
+        with pytest.raises(ValueError):
+            FedJob(name=name)
+
+    def test_validate_targets(self):
+        job = FedJob()
+        controller = FedAvg()
+        executor = ModelLearnerExecutor(learner_id=job.as_id(_create_model_learner()))
+
+        job.to(controller, "server")
+        job.to(executor, "site-1")
+
+        with pytest.raises(Exception):
+            job.to(executor, "site-/1")
+
+    def test_non_empty_target(self):
+        job = FedJob()
+        component = FedAvg()
+        with pytest.raises(Exception):
+            job.to(component, None)  # type: ignore[arg-type]  # intentionally testing invalid input
+
+    def test_add_params_functionality(self):
+        """Test that add_params functionality works correctly."""
+        job = FedJob(name="test_job")
+
+        # Add a controller to server
+        controller = FedAvg()
+        job.to_server(controller)
+
+        # Add an executor to clients
+        executor = ModelLearnerExecutor(learner_id=job.as_id(_create_model_learner()))
+        job.to_clients(executor)
+
+        # Add additional arguments to server
+        server_params = {"timeout": 600, "max_retries": 3, "heartbeat_interval": 30}
+        job.to_server(server_params)
+
+        # Add additional arguments to clients
+        client_params = {"submit_task_result_timeout": 300}
+        job.to_clients(client_params)
+
+        # Export the job to verify the params are included
+        with tempfile.TemporaryDirectory() as temp_dir:
+            job.export_job(temp_dir)
+
+            # Check server config
+            server_config_path = os.path.join(temp_dir, "test_job", "app", "config", "config_fed_server.json")
+            assert os.path.exists(server_config_path)
+
+            with open(server_config_path, "r") as f:
+                server_config = json.load(f)
+
+            # Verify server params are included
+            for key, value in server_params.items():
+                assert key in server_config
+                assert server_config[key] == value
+
+            # Check client config
+            client_config_path = os.path.join(temp_dir, "test_job", "app", "config", "config_fed_client.json")
+            assert os.path.exists(client_config_path)
+
+            with open(client_config_path, "r") as f:
+                client_config = json.load(f)
+
+            # Verify client params are included
+            for key, value in client_params.items():
+                assert key in client_config
+                assert client_config[key] == value
+
+    def test_same_executor_instance_exports_combined_task_routes(self, tmp_path):
+        job = FedJob(name="same_executor_multiple_tasks")
+        job.to_server(FedAvg())
+        executor = ClientAPIExecutor(execution_mode="external_process", command="python train.py")
+
+        job.to_clients(executor, tasks=["train"])
+        job.to_clients(executor, tasks=["evaluate", "submit_model"])
+        job.export_job(str(tmp_path))
+
+        client_config_path = tmp_path / job.name / "app" / "config" / "config_fed_client.json"
+        client_config = json.loads(client_config_path.read_text())
+
+        assert len(client_config["executors"]) == 1
+        assert client_config["executors"][0]["tasks"] == ["train", "evaluate", "submit_model"]
+
+    def test_fail_fast_false_by_default(self):
+        """fail_fast should default to False and not inject dead_client_grace_period."""
+        job = FedJob(name="test_job")
+        assert job._fail_fast is False
+
+        controller = FedAvg()
+        job.to_server(controller)
+        executor = ModelLearnerExecutor(learner_id=job.as_id(_create_model_learner()))
+        job.to_clients(executor)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            job.export_job(temp_dir)
+            server_config_path = os.path.join(temp_dir, "test_job", "app", "config", "config_fed_server.json")
+            with open(server_config_path, "r") as f:
+                server_config = json.load(f)
+            assert ConfigVarName.DEAD_CLIENT_GRACE_PERIOD not in server_config
+
+    def test_fail_fast_true_sets_grace_period_zero(self):
+        """fail_fast=True should write dead_client_grace_period=0 to config_fed_server.json."""
+        job = FedJob(name="test_job", fail_fast=True)
+        assert job._fail_fast is True
+
+        controller = FedAvg()
+        job.to_server(controller)
+        executor = ModelLearnerExecutor(learner_id=job.as_id(_create_model_learner()))
+        job.to_clients(executor)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            job.export_job(temp_dir)
+            server_config_path = os.path.join(temp_dir, "test_job", "app", "config", "config_fed_server.json")
+            with open(server_config_path, "r") as f:
+                server_config = json.load(f)
+            assert ConfigVarName.DEAD_CLIENT_GRACE_PERIOD in server_config
+            assert server_config[ConfigVarName.DEAD_CLIENT_GRACE_PERIOD] == 0
+
+    def test_fail_fast_invalid_type_raises(self):
+        """fail_fast must be a bool; passing a non-bool should raise TypeError."""
+        with pytest.raises(TypeError, match="fail_fast must be"):
+            FedJob(name="test_job", fail_fast=1)  # type: ignore[arg-type]
+
+    def test_fail_fast_does_not_affect_client_config(self):
+        """fail_fast=True should only modify the server config, not the client config."""
+        job = FedJob(name="test_job", fail_fast=True)
+
+        controller = FedAvg()
+        job.to_server(controller)
+        executor = ModelLearnerExecutor(learner_id=job.as_id(_create_model_learner()))
+        job.to_clients(executor)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            job.export_job(temp_dir)
+            client_config_path = os.path.join(temp_dir, "test_job", "app", "config", "config_fed_client.json")
+            with open(client_config_path, "r") as f:
+                client_config = json.load(f)
+            assert ConfigVarName.DEAD_CLIENT_GRACE_PERIOD not in client_config
+
+
+class TestFedAppAddResource:
+    """Test FedApp._add_resource() method for handling different resource types."""
+
+    def setup_method(self):
+        self.app = FedApp(ClientAppConfig())
+
+    def test_add_resource_existing_file(self):
+        """Test adding an existing file as resource."""
+        with tempfile.NamedTemporaryFile(suffix=".py", delete=False) as f:
+            f.write(b"# test script")
+            temp_path = f.name
+
+        try:
+            self.app._add_resource(temp_path)
+            assert temp_path in self.app.app_config.ext_scripts
+        finally:
+            os.unlink(temp_path)
+
+    def test_add_resource_existing_directory(self):
+        """Test adding an existing directory as resource."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.app._add_resource(temp_dir)
+            assert temp_dir in self.app.app_config.ext_dirs
+
+    def test_add_resource_absolute_path_not_exists(self):
+        """Test adding an absolute path that doesn't exist locally.
+
+        This simulates pre-installed scripts in production environments.
+        The resource should be added without error; validation happens later in deploy().
+        """
+        non_existent_abs_path = "/preinstalled/scripts/remote_train.py"
+        self.app._add_resource(non_existent_abs_path)
+        assert non_existent_abs_path in self.app.app_config.ext_scripts
+
+    def test_add_resource_relative_path_not_exists_raises_error(self):
+        """Test that adding a non-existent relative path raises an error."""
+        non_existent_rel_path = "scripts/does_not_exist.py"
+        with pytest.raises(ValueError, match="it must be either a directory or file"):
+            self.app._add_resource(non_existent_rel_path)
+
+    def test_add_resource_invalid_type_raises_error(self):
+        """Test that adding a non-string resource raises an error."""
+        with pytest.raises(ValueError, match="resource must be a str"):
+            self.app._add_resource(123)  # type: ignore[arg-type]  # intentionally testing invalid input
+
+
+class TestBaseFedJobFileToMethods:
+    """Tests for add_file_to_* methods in BaseFedJob."""
+
+    def test_add_file_to_server(self):
+        """Test adding a file to server app custom directory."""
+        job = FedJob(name="test_job")
+        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+            temp_file = f.name
+        try:
+            job.add_file_to_server(temp_file)
+            # Verify server app was created and file was added
+            assert "server" in job._deploy_map
+            server_app = job._deploy_map["server"]
+            # file_sources is list of tuples (path, dest_dir, rename)
+            assert any(temp_file == src[0] for src in server_app.app_config.file_sources)
+        finally:
+            os.unlink(temp_file)
+
+    def test_add_file_to_server_with_dest_dir(self):
+        """Test adding a file to server app with custom destination directory."""
+        job = FedJob(name="test_job")
+        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+            temp_file = f.name
+        try:
+            job.add_file_to_server(temp_file, dest_dir="models")
+            server_app = job._deploy_map["server"]
+            # File should be added with destination directory
+            assert any(temp_file == src[0] and src[1] == "models" for src in server_app.app_config.file_sources)
+        finally:
+            os.unlink(temp_file)
+
+    def test_add_file_to_clients(self):
+        """Test adding a file to all client apps custom directory."""
+        job = FedJob(name="test_job")
+        with tempfile.NamedTemporaryFile(suffix=".py", delete=False) as f:
+            temp_file = f.name
+        try:
+            job.add_file_to_clients(temp_file)
+            # Verify all-sites client app was created and file was added
+            assert "@ALL" in job._deploy_map
+            client_app = job._deploy_map["@ALL"]
+            assert any(temp_file == src[0] for src in client_app.app_config.file_sources)
+        finally:
+            os.unlink(temp_file)
+
+    def test_add_file_to_specific_site(self):
+        """Test adding a file to a specific site."""
+        job = FedJob(name="test_job")
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            temp_file = f.name
+        try:
+            job.add_file_to(temp_file, target="site-1")
+            # Verify site-1 client app was created and file was added
+            assert "site-1" in job._deploy_map
+            site_app = job._deploy_map["site-1"]
+            assert any(temp_file == src[0] for src in site_app.app_config.file_sources)
+        finally:
+            os.unlink(temp_file)
+
+    def test_add_multiple_files_to_server(self):
+        """Test adding multiple files to server app."""
+        job = FedJob(name="test_job")
+        temp_files = []
+        try:
+            for i in range(3):
+                f = tempfile.NamedTemporaryFile(suffix=f"_{i}.pt", delete=False)
+                temp_files.append(f.name)
+                f.close()
+
+            for temp_file in temp_files:
+                job.add_file_to_server(temp_file)
+
+            server_app = job._deploy_map["server"]
+            for temp_file in temp_files:
+                assert any(temp_file == src[0] for src in server_app.app_config.file_sources)
+        finally:
+            for temp_file in temp_files:
+                os.unlink(temp_file)
+
+    def test_add_file_to_invalid_target(self):
+        """Test that invalid target raises error."""
+        job = FedJob(name="test_job")
+        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+            temp_file = f.name
+        try:
+            with pytest.raises(ValueError, match="target.*invalid character"):
+                job.add_file_to(temp_file, target="site@invalid")
+        finally:
+            os.unlink(temp_file)
+
+
+class TestSimulatorRunClientValidation:
+    """Tests for FedJob.simulator_run() clients vs n_clients validation."""
+
+    def _make_job(self):
+        """Return a FedJob with _deployed=True so _set_all_apps() is a no-op."""
+        job = FedJob(name="test_job")
+        job._deployed = True
+        return job
+
+    def test_clients_and_n_clients_raises(self, tmp_path):
+        """Providing both clients and n_clients should raise ValueError."""
+        job = self._make_job()
+        with patch.object(job.job, "simulator_run"):
+            with pytest.raises(ValueError, match="already specified clients"):
+                job.simulator_run(str(tmp_path), clients=["site-1", "site-2"], n_clients=2)
+
+    def test_mismatched_n_clients_raises(self, tmp_path):
+        """n_clients with any named clients should raise ValueError."""
+        job = self._make_job()
+        with patch.object(job.job, "simulator_run"):
+            with pytest.raises(ValueError, match="already specified clients"):
+                job.simulator_run(str(tmp_path), clients=["site-1", "site-2"], n_clients=3)
+
+    def test_clients_only_no_n_clients_passes(self, tmp_path):
+        """Providing only clients (no n_clients) should pass."""
+        job = self._make_job()
+        with patch.object(job.job, "simulator_run", return_value=0):
+            job.simulator_run(str(tmp_path), clients=["site-1", "site-2"])
+
+    def test_simulator_run_returns_process_status(self, tmp_path):
+        """FedJob.simulator_run() should surface the lower simulator status."""
+        job = self._make_job()
+        with patch.object(job.job, "simulator_run", return_value=2):
+            assert job.simulator_run(str(tmp_path), clients=["site-1", "site-2"]) == 2

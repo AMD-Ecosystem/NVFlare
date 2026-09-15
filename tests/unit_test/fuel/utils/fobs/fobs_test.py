@@ -1,0 +1,184 @@
+# Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import queue
+from datetime import datetime
+from typing import Any
+
+import pytest
+
+from nvflare.apis.dxo import DXO, DataKind
+from nvflare.apis.utils.decomposers.flare_decomposers import DXODecomposer
+from nvflare.fuel.utils import fobs
+from nvflare.fuel.utils.buffer_list import ConsumableBufferList
+from nvflare.fuel.utils.fobs import Decomposer
+from nvflare.fuel.utils.fobs import fobs as fobs_impl
+from nvflare.fuel.utils.fobs.datum import DatumManager
+
+
+class TestFobs:
+
+    NUMBER = 123456
+    FLOAT = 123.456
+    NAME = "FOBS Test"
+    SET = {4, 5, 6}
+    NOW = datetime.now()
+
+    test_data = {
+        "str": "Test string",
+        "number": NUMBER,
+        "float": FLOAT,
+        "list": [7, 8, 9],
+        "set": SET,
+        "tuple": ("abc", "xyz"),
+        "time": NOW,
+    }
+
+    def test_builtin(self):
+        buf = fobs.dumps(TestFobs.test_data)
+        data = fobs.loads(buf)
+        assert data["number"] == TestFobs.NUMBER
+        assert data["set"] == TestFobs.SET
+
+    def test_unsupported_classes(self):
+        with pytest.raises(Exception):
+            # Queue contains collections.deque, which has no __dict__, can't be handled as Data Class
+            unsupported_class = queue.Queue()
+            try:
+                fobs.dumps(unsupported_class)
+            except Exception as ex:
+                print(ex)
+                raise ex
+
+    def test_decomposers(self):
+        test_class = ExampleClass(TestFobs.NUMBER)
+        fobs.register(ExampleClassDecomposer)
+        buf = fobs.dumps(test_class)
+        new_class = fobs.loads(buf)
+        assert new_class.number == TestFobs.NUMBER
+
+    def test_no_registration(self):
+        test_class = ExampleClass(TestFobs.NUMBER)
+        fobs.register(ExampleClassDecomposer)
+        buf = fobs.dumps(test_class)
+        # Unregister the decomposer
+        fobs.reset()
+
+        # ExampleClassDecomposer is not builtin, not allowed
+        with pytest.raises(ValueError):
+            new_class = fobs.loads(buf)
+            assert new_class.number == TestFobs.NUMBER
+
+    def test_whitelist_enforcement(self):
+        fobs.reset()
+        # Serialize ExampleDataClass (auto-registers it with DataClassDecomposer)
+        test_class = ExampleDataClass(TestFobs.NAME)
+        buf = fobs.dumps(test_class)
+        fobs.reset()
+
+        # After reset, ExampleDataClass is not in the whitelist.
+        # DataClassDecomposer is a builtin decomposer so the decomposer check passes,
+        # but the type whitelist check should block deserialization.
+        with pytest.raises(ValueError, match="not allowed"):
+            fobs.loads(buf)
+
+        # After explicitly adding to the whitelist, deserialization should succeed.
+        fobs.add_type_name_whitelist("tests.unit_test.fuel.utils.fobs.fobs_test.ExampleDataClass")
+        new_class = fobs.loads(buf)
+        assert new_class.name == TestFobs.NAME
+        fobs.reset()
+
+    def test_auto_registration(self):
+        fobs.reset()
+        test_class = ExampleDataClass(TestFobs.NAME)
+        # pack() auto-registers a session-scoped DataClassDecomposer for ExampleDataClass.
+        buf = fobs.dumps(test_class)
+        new_class = fobs.loads(buf)
+        assert new_class.name == TestFobs.NAME
+
+    def test_builtin_custom_decomposer_type_allowed_after_reset(self):
+        fobs.reset()
+        fobs.register(DXODecomposer)
+        dxo = DXO(data_kind=DataKind.WEIGHTS, data={"w": 1.0})
+        buf = fobs.dumps(dxo)
+
+        # After reset, DXODecomposer will not be in _decomposers. The type name must still
+        # pass the whitelist gate so the builtin decomposer can be re-registered during unpack.
+        fobs.reset()
+        restored = fobs.loads(buf)
+        assert isinstance(restored, DXO)
+        assert restored.data_kind == DataKind.WEIGHTS
+        assert restored.data == {"w": 1.0}
+        fobs.reset()
+
+    def test_reset_mutates_whitelist_in_place(self):
+        fobs.reset()
+        whitelist_ref = fobs_impl._type_name_whitelist
+        fobs.add_type_name_whitelist("tests.unit_test.fuel.utils.fobs.fobs_test.ExampleDataClass")
+        assert "tests.unit_test.fuel.utils.fobs.fobs_test.ExampleDataClass" in whitelist_ref
+
+        fobs.reset()
+        assert fobs_impl._type_name_whitelist is whitelist_ref
+        assert "tests.unit_test.fuel.utils.fobs.fobs_test.ExampleDataClass" not in whitelist_ref
+
+    def test_buffer_list(self):
+        buf = fobs.dumps(TestFobs.test_data, buffer_list=True)
+        data = fobs.loads(buf)
+        assert data["number"] == TestFobs.NUMBER
+
+    def test_buffer_list_reassembles_externalized_bytes_from_network_chunks(self):
+        expected = b"x" * 2048
+        encoded = fobs.dumps({"blob": expected}, buffer_list=True, max_value_size=1024)
+        wire_data = b"".join(encoded)
+        network_chunks = [memoryview(wire_data)[start : start + 127] for start in range(0, len(wire_data), 127)]
+
+        data = fobs.loads(network_chunks)
+
+        assert type(data["blob"]) is bytes
+        assert data["blob"] == expected
+        assert network_chunks
+
+    def test_buffer_list_releases_consumable_network_chunks(self):
+        expected = b"x" * 2048
+        encoded = fobs.dumps({"blob": expected}, buffer_list=True, max_value_size=1024)
+        wire_data = b"".join(encoded)
+        network_chunks = ConsumableBufferList(
+            memoryview(wire_data)[start : start + 127] for start in range(0, len(wire_data), 127)
+        )
+
+        data = fobs.loads(network_chunks)
+
+        assert data["blob"] == expected
+        assert not network_chunks
+
+
+class ExampleClass:
+    def __init__(self, number):
+        self.number = number
+
+
+class ExampleDataClass:
+    def __init__(self, name):
+        self.name = name
+
+
+class ExampleClassDecomposer(Decomposer):
+    def supported_type(self):
+        return ExampleClass
+
+    def decompose(self, target: ExampleClass, manager: DatumManager = None) -> Any:
+        return target.number
+
+    def recompose(self, data: Any, manager: DatumManager = None) -> ExampleClass:
+        return ExampleClass(data)

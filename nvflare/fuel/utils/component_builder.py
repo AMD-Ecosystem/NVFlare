@@ -1,0 +1,131 @@
+# Copyright (c) 2021, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from abc import ABC, abstractmethod
+
+from nvflare.fuel.common.excepts import ComponentNotAuthorized, ConfigError
+from nvflare.fuel.utils.class_utils import get_class_path_from_config, instantiate_class
+from nvflare.security.logging import secure_format_exception
+
+
+class ConfigType:
+    COMPONENT = "component"
+    DICT = "dict"
+
+
+class ComponentBuilder(ABC):
+    @abstractmethod
+    def get_module_scanner(self):
+        """Provide the package module scanner.
+
+        Returns: module_scanner
+
+        """
+        pass
+
+    def is_class_config(self, config_dict: dict) -> bool:
+        def has_valid_class_path():
+            try:
+                _ = self.get_class_path(config_dict)
+                # we have valid class path
+                return True
+            except ConfigError:
+                # this is not a valid class path
+                return False
+
+        # use config_type to distinguish between components and regular dictionaries
+        config_type = config_dict.get("config_type", ConfigType.COMPONENT)
+        if config_type != ConfigType.COMPONENT:
+            return False
+
+        # regardless it has args or not. if path/class_path/name and valid class path, very likely we have
+        # class config. "class_path" is accepted for consistency with recipe/model config API.
+        if ("path" in config_dict or "class_path" in config_dict or "name" in config_dict) and has_valid_class_path():
+            return True
+        else:
+            return False
+
+    def is_authorizable_component_config(self, config_dict: dict, node=None) -> bool:
+        """Return whether this dict should be checked by a component-build authorizer.
+
+        ``config_type: dict`` means the normal nested builder should pass the dict through
+        without instantiating it.  Entries under a ``components`` list are different:
+        they are later built as top-level components, and those entries require an
+        ``id``.  Treat those explicit component-list entries as authorizable even when
+        they set ``config_type`` to ``dict`` so the allow-list cannot be bypassed before
+        the later build.
+        """
+        if not isinstance(config_dict, dict):
+            return False
+
+        if self._is_component_list_entry(config_dict, node):
+            return True
+
+        try:
+            return self.is_class_config(config_dict)
+        except ConfigError:
+            return False
+
+    @staticmethod
+    def _is_component_list_entry(config_dict: dict, node=None) -> bool:
+        if "id" not in config_dict or not (
+            "path" in config_dict or "class_path" in config_dict or "name" in config_dict
+        ):
+            return False
+
+        node_path = getattr(node, "paths", None)
+        if not node_path or len(node_path) < 2:
+            return False
+
+        return node_path[-2] == "components" and str(node_path[-1]).startswith("#")
+
+    def build_nested_component(self, config_dict, arg_name):
+        return self.build_component(config_dict)
+
+    def build_component(self, config_dict):
+        if not config_dict:
+            return None
+
+        if not isinstance(config_dict, dict):
+            raise ConfigError("component config must be dict but got {}.".format(type(config_dict)))
+
+        if config_dict.get("disabled") is True:
+            return None
+
+        class_args = config_dict.get("args", dict())
+        for k, v in class_args.items():
+            if isinstance(v, dict) and self.is_class_config(v):
+                # try to replace the arg with a component
+                try:
+                    t = self.build_nested_component(v, k)
+                    class_args[k] = t
+                except ComponentNotAuthorized:
+                    raise
+                except Exception as e:
+                    raise ValueError(f"failed to instantiate class: {secure_format_exception(e)} ")
+
+        class_path = self.get_class_path(config_dict)
+
+        # Handle the special case, if config pass in the class_attributes, use the user defined class attributes
+        # parameters directly.
+        if "class_attributes" in class_args:
+            class_args = class_args["class_attributes"]
+
+        return instantiate_class(class_path, class_args)
+
+    def get_class_path(self, config_dict):
+        return get_class_path_from_config(
+            config_dict,
+            resolve_name=lambda cn: self.get_module_scanner().get_module_name(cn),
+        )

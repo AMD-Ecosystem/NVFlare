@@ -1,0 +1,1807 @@
+# Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import json
+import os
+import time
+from typing import List, Optional
+
+from nvflare.apis.fl_constant import (
+    JOB_CLONE_DEPRECATION_MESSAGE,
+    SUBMIT_TOKEN_CONFLICT_STATUS,
+    SUBMIT_TOKEN_JOB_DELETED_STATUS,
+    AdminCommandNames,
+    WorkspaceConstants,
+)
+from nvflare.apis.fl_exception import FLCommunicationError
+from nvflare.apis.job_def import DEFAULT_STUDY, JobMetaKey
+from nvflare.apis.utils.format_check import name_check
+from nvflare.apis.utils.job_submit_token import validate_submit_token
+from nvflare.apis.workspace import Workspace
+from nvflare.fuel.common.excepts import ConfigError
+from nvflare.fuel.hci.client.api import AdminAPI, APIStatus, ResultKey
+from nvflare.fuel.hci.client.api_spec import AdminConfigKey, UidSource
+from nvflare.fuel.hci.client.config import secure_load_admin_config
+from nvflare.fuel.hci.cmd_arg_utils import (
+    join_args,
+    process_targets_into_str,
+    validate_file_string,
+    validate_options_string,
+    validate_path_string,
+    validate_required_target_string,
+)
+from nvflare.fuel.hci.proto import MetaKey, MetaStatusValue, ProtoKey, ReplyKeyword
+from nvflare.fuel.utils.deprecated import warn_deprecated
+from nvflare.fuel.utils.log_utils import get_obj_logger, validate_site_log_config
+
+from .api_spec import (
+    AuthenticationError,
+    AuthorizationError,
+    ClientInfo,
+    ClientsStillRunning,
+    CommandError,
+    InternalError,
+    InvalidArgumentError,
+    InvalidJobDefinition,
+    InvalidTarget,
+    JobInfo,
+    JobNotDone,
+    JobNotFound,
+    JobNotRunning,
+    JobTimeout,
+    MonitorReturnCode,
+    NoClientsAvailable,
+    NoConnection,
+    NoReply,
+    ServerInfo,
+    SessionClosed,
+    SessionExpired,
+    SessionSpec,
+    SubmitTokenConflict,
+    SubmitTokenJobDeleted,
+    SystemInfo,
+    TargetType,
+)
+
+_VALID_TARGET_TYPES = [TargetType.ALL, TargetType.SERVER, TargetType.CLIENT]
+_DEFAULT_STATE_CHANGE_TIMEOUT = 30.0
+_STATE_CHANGE_POLL_INTERVAL = 0.5
+_STATE_CHANGE_CONNECT_TIMEOUT = 1.0
+_LEGACY_TERMINAL_JOB_STATUSES = {
+    "FINISHED_OK",
+    "FINISHED_EXCEPTION",
+    "ABORTED",
+    "ABANDONED",
+    "FAILED",
+}
+_CONNECTION_RETRY_COMMANDS = {AdminCommandNames.ABORT_JOB, AdminCommandNames.SHUTDOWN}
+_CONNECTION_RETRY_ATTEMPTS = 3
+_CONNECTION_RETRY_BACKOFF = 0.5
+
+
+def _command_name(command: str) -> str:
+    parts = command.split(maxsplit=1)
+    return parts[0] if parts else ""
+
+
+def _should_retry_connection_failure(command: str, result: dict) -> bool:
+    return (
+        _command_name(command) in _CONNECTION_RETRY_COMMANDS
+        and isinstance(result, dict)
+        and result.get(ResultKey.STATUS) == APIStatus.ERROR_SERVER_CONNECTION
+    )
+
+
+def _is_terminal_job_status(status: str) -> bool:
+    return isinstance(status, str) and (status.startswith("FINISHED") or status in _LEGACY_TERMINAL_JOB_STATUSES)
+
+
+def _validate_job_polling_options(timeout: float, poll_interval: float) -> None:
+    if timeout < 0:
+        raise InvalidArgumentError("timeout must be >= 0")
+    if poll_interval <= 0:
+        raise InvalidArgumentError("poll_interval must be > 0")
+
+
+def _validate_submit_token_arg(submit_token: Optional[str]) -> Optional[str]:
+    try:
+        return validate_submit_token(submit_token)
+    except ValueError as ex:
+        raise InvalidArgumentError(str(ex)) from ex
+
+
+__all__ = ["NoConnection", "NoReply", "SystemInfo", "TargetType"]
+
+
+def _validate_target_strs(targets: List[str]) -> None:
+    """Validate that each item in ``targets`` is a well-formed target name.
+
+    Wraps :func:`process_targets_into_str` for its validation side-effect only —
+    the joined string it returns is intentionally discarded because callers then
+    do ``parts.extend(targets)`` so that every name becomes its own command
+    argument. If the joined string were appended instead, :func:`join_args`
+    would wrap the whitespace-containing element in double quotes, and the
+    server's ``shlex.split`` in ``parse_command_line`` would collapse multiple
+    names back into a single token (see NVBug 6098943).
+    """
+    process_targets_into_str(targets)
+
+
+class Session(SessionSpec):
+    def __init__(
+        self,
+        username: str,
+        startup_path: str,
+        secure_mode: bool = True,
+        debug: bool = False,
+        study: str = DEFAULT_STUDY,
+    ):
+        """Initializes a session with the NVFLARE system.
+
+        Args:
+            username (str): string of username to log in with
+            startup_path (str): path to the provisioned startup kit, which contains endpoint of the system
+            secure_mode (bool): whether to log in with secure mode
+            debug (bool): turn on debug or not
+            study (str): active study context for submitted jobs and session-scoped job listing; defaults to
+                "default"
+        """
+        assert isinstance(username, str), "username must be str"
+        assert isinstance(startup_path, str), "startup_path must be str"
+        assert isinstance(study, str), "study must be str"
+        assert os.path.isdir(startup_path), f"startup kit does not exist at {startup_path}"
+
+        self.startup_path = startup_path
+        self.secure_mode = secure_mode
+        workspace = Workspace(root_dir=startup_path)
+        conf = secure_load_admin_config(workspace)
+        admin_config = conf.get_admin_config()
+        if not admin_config:
+            raise ConfigError("Missing admin section in fed_admin configuration.")
+
+        if not secure_mode:
+            admin_config[AdminConfigKey.UID_SOURCE] = UidSource.CERT
+
+        self.username = username
+        self._debug = debug
+        upload_dir = admin_config.get(AdminConfigKey.UPLOAD_DIR)
+        download_dir = admin_config.get(AdminConfigKey.DOWNLOAD_DIR)
+        if not os.path.isdir(download_dir):
+            os.makedirs(download_dir)
+
+        self.api = AdminAPI(
+            admin_config=admin_config,
+            user_name=username,
+            debug=debug,
+            event_handlers=conf.handlers,
+            study=study,
+        )
+        self.upload_dir = upload_dir
+        self.download_dir = download_dir
+        self._study = study
+        if name_check(self._study, "study")[0]:
+            raise ValueError(
+                f"study name '{self._study}' contains unsupported characters. Use only lowercase letters, numbers, underscores, and hyphens."
+            )
+
+    def close(self):
+        """Close the session."""
+        self.api.logout()
+
+    def _raise_if_session_expired(self):
+        session_expired_reason = getattr(self.api, "session_expired_reason", None)
+        if isinstance(session_expired_reason, str) and session_expired_reason:
+            raise SessionExpired(session_expired_reason)
+
+    def try_connect(self, timeout):
+        self._raise_if_session_expired()
+        if self.api.closed:
+            raise SessionClosed("session closed")
+
+        try:
+            self.api.connect(timeout)
+        except FLCommunicationError as e:
+            message = str(e)
+            if "cannot connect to server" in message or "cannot authenticate to server" in message:
+                raise NoConnection(message) from e
+            raise
+        result = self.api.login()
+        status = result.get(ResultKey.STATUS) if isinstance(result, dict) else None
+        details = result.get(ResultKey.DETAILS, "") if isinstance(result, dict) else ""
+        if status == APIStatus.SUCCESS:
+            return
+        if status in [APIStatus.ERROR_AUTHENTICATION, APIStatus.ERROR_CERT]:
+            raise AuthenticationError(details or "authentication failed", auth_code=result.get("auth_code"))
+        if status == APIStatus.ERROR_AUTHORIZATION:
+            raise AuthorizationError(details or "authorization failed")
+        if status == APIStatus.ERROR_SERVER_CONNECTION:
+            raise NoConnection(details or "cannot connect to server")
+        raise InternalError(details or f"login failed: {status}")
+
+    def _do_command(self, command: str, enforce_meta=True, props=None):
+        self._raise_if_session_expired()
+        if self.api.closed:
+            raise SessionClosed("session closed")
+
+        result = None
+        for attempt in range(_CONNECTION_RETRY_ATTEMPTS):
+            result = self.api.do_command(command, props=props)
+            self._raise_if_session_expired()
+            if not _should_retry_connection_failure(command, result) or attempt >= _CONNECTION_RETRY_ATTEMPTS - 1:
+                break
+            time.sleep(_CONNECTION_RETRY_BACKOFF * (attempt + 1))
+
+        if not isinstance(result, dict):
+            raise InternalError(f"result from server must be dict but got {type(result)}")
+
+        # Check meta status if available
+        # There are still some commands that do not return meta. But for commands that do return meta, we will check
+        # its meta status first.
+        meta = result.get(ResultKey.META, None)
+        if meta:
+            if not isinstance(meta, dict):
+                raise InternalError(f"meta must be dict but got {type(meta)}")
+
+            cmd_status = meta.get(MetaKey.STATUS, MetaStatusValue.OK)
+            info = meta.get(MetaKey.INFO, "")
+            if cmd_status == MetaStatusValue.INVALID_JOB_DEFINITION:
+                raise InvalidJobDefinition(f"invalid job definition: {info}")
+            elif cmd_status == SUBMIT_TOKEN_CONFLICT_STATUS:
+                raise SubmitTokenConflict(
+                    info or "submit token was already used for different job content",
+                    meta.get(MetaKey.JOB_ID),
+                )
+            elif cmd_status == SUBMIT_TOKEN_JOB_DELETED_STATUS:
+                raise SubmitTokenJobDeleted(
+                    info or "submit token refers to a deleted job",
+                    meta.get(MetaKey.JOB_ID),
+                    meta.get("submit_record_state"),
+                    meta.get("deleted_time"),
+                )
+            elif cmd_status == MetaStatusValue.NOT_AUTHORIZED:
+                raise AuthorizationError(f"user not authorized for the action '{command}: {info}'")
+            elif cmd_status == MetaStatusValue.NOT_AUTHENTICATED:
+                raise AuthenticationError(f"user not authenticated: {info}")
+            elif cmd_status == MetaStatusValue.SYNTAX_ERROR:
+                raise InternalError(f"syntax error: {info}")
+            elif cmd_status == MetaStatusValue.INVALID_JOB_ID:
+                raise JobNotFound(f"no such job: {info}")
+            elif cmd_status == MetaStatusValue.JOB_RUNNING:
+                raise JobNotDone(f"job {info} is still running")
+            elif cmd_status == MetaStatusValue.JOB_NOT_RUNNING:
+                raise JobNotRunning(f"job {info} is not running")
+            elif cmd_status == MetaStatusValue.CLIENTS_RUNNING:
+                raise ClientsStillRunning("one or more clients are still running")
+            elif cmd_status == MetaStatusValue.NO_CLIENTS:
+                raise NoClientsAvailable(ReplyKeyword.NO_CLIENTS)
+            elif cmd_status == MetaStatusValue.INTERNAL_ERROR:
+                raise InternalError(f"server internal error: {info}")
+            elif cmd_status == MetaStatusValue.INVALID_TARGET:
+                if info == ReplyKeyword.NO_CLIENTS:
+                    raise NoClientsAvailable(ReplyKeyword.NO_CLIENTS)
+                else:
+                    raise InvalidTarget(info)
+            elif cmd_status == MetaStatusValue.NO_REPLY:
+                raise NoReply(info)
+            elif cmd_status != MetaStatusValue.OK:
+                raise InternalError(f"{cmd_status}: {info}")
+
+        # Then check API Status. There are cases that a command does not return meta or ran into errors before
+        # setting meta. Even if the command does return meta, still need to make sure APIStatus is good.
+        status = result.get(ResultKey.STATUS, None)
+        if not status:
+            raise InternalError("missing status in result")
+
+        if status in [APIStatus.ERROR_CERT, APIStatus.ERROR_AUTHENTICATION]:
+            details = result.get(ResultKey.DETAILS, "")
+            raise AuthenticationError(details or f"user not authenticated: {status}", auth_code=result.get("auth_code"))
+        elif status == APIStatus.ERROR_AUTHORIZATION:
+            raise AuthorizationError(f"user not authorized for the action '{command}'")
+        elif status == APIStatus.ERROR_INACTIVE_SESSION:
+            raise SessionClosed("the session is closed on server")
+        elif status in [APIStatus.ERROR_PROTOCOL, APIStatus.ERROR_SYNTAX]:
+            status_text = status.value if hasattr(status, "value") else str(status)
+            details = result.get(ResultKey.DETAILS, "")
+            if details:
+                raise InternalError(f"protocol error: {status_text}: {details}")
+            raise InternalError(f"protocol error: {status_text}")
+        elif status in [APIStatus.ERROR_SERVER_CONNECTION]:
+            status_text = status.value if hasattr(status, "value") else str(status)
+            raise NoConnection(f"cannot connect to server: {status_text}")
+        elif status != APIStatus.SUCCESS:
+            details = result.get(ResultKey.DETAILS, "")
+            raise RuntimeError(f"runtime error encountered: {status}: {details}")
+
+        if enforce_meta and not meta:
+            raise InternalError("missing meta from result")
+
+        # both API Status and Meta are okay
+        return result
+
+    @staticmethod
+    def _validate_job_id(job_id: str):
+        if not isinstance(job_id, str):
+            raise JobNotFound(f"invalid job_id {job_id}")
+
+        if not job_id:
+            raise JobNotFound("job_id is required but not specified.")
+
+    def clone_job(self, job_id: str) -> str:
+        """Create a new job by cloning a specified job.
+
+        .. deprecated:: 2.10.0
+           Use ``nvflare job submit -j JOB_FOLDER`` with the original local job folder.
+
+        Args:
+            job_id: job to be cloned
+
+        Returns: ID of the new job
+
+        """
+        warn_deprecated(JOB_CLONE_DEPRECATION_MESSAGE, stacklevel=3)
+        self._validate_job_id(job_id)
+        result = self._do_command(AdminCommandNames.CLONE_JOB + " " + job_id)
+        meta = result[ResultKey.META]
+        job_id = meta.get(MetaKey.JOB_ID, None)
+        info = meta.get(MetaKey.INFO, "")
+        if not job_id:
+            raise InternalError(f"server failed to return job id: {info}")
+        return job_id
+
+    def submit_job(self, job_definition_path: str, submit_token: str = None) -> str:
+        """Submit a predefined job to the NVFLARE system.
+
+        Args:
+            job_definition_path: path to the folder that defines a NVFLARE job
+            submit_token: optional retry-safe submit token scoped by study and submitter
+
+        Returns: the job id if accepted by the system
+
+        If the submission fails, an exception will be raised.
+
+        """
+        if not job_definition_path:
+            raise InvalidJobDefinition("job_definition_path is required but not specified.")
+
+        if not isinstance(job_definition_path, str):
+            raise InvalidJobDefinition(f"job_definition_path must be str but got {type(job_definition_path)}.")
+
+        if not os.path.isdir(job_definition_path):
+            if os.path.isdir(os.path.join(self.upload_dir, job_definition_path)):
+                job_definition_path = os.path.join(self.upload_dir, job_definition_path)
+                job_definition_path = os.path.abspath(job_definition_path)
+            else:
+                raise InvalidJobDefinition(f"job_definition_path '{job_definition_path}' is not a valid folder")
+
+        job_folder_name = os.path.basename(os.path.normpath(job_definition_path))
+        if name_check(job_folder_name, "job_name")[0]:
+            raise InvalidJobDefinition(
+                f"job folder name '{job_folder_name}' contains unsupported characters. "
+                "Use only letters, numbers, dots, underscores, and hyphens, with no spaces."
+            )
+        submit_token = _validate_submit_token_arg(submit_token)
+        parts = [AdminCommandNames.SUBMIT_JOB, job_definition_path]
+        if submit_token:
+            parts.extend(["--submit-token", submit_token])
+        result = self._do_command(join_args(parts))
+        meta = result[ResultKey.META]
+        job_id = meta.get(MetaKey.JOB_ID, None)
+        if not job_id:
+            raise InternalError("server failed to return job id")
+        return job_id
+
+    def get_job_meta(self, job_id: str) -> dict:
+        """Get the meta info of the specified job.
+
+        Args:
+            job_id: ID of the job
+
+        Returns: a dict of job metadata
+
+        """
+        self._validate_job_id(job_id)
+        result = self._do_command(AdminCommandNames.GET_JOB_META + " " + job_id)
+        meta = result[ResultKey.META]
+        job_meta = meta.get(MetaKey.JOB_META, None)
+        if not job_meta:
+            raise InternalError("server failed to return job meta")
+        return job_meta
+
+    def list_jobs(
+        self,
+        detailed: bool = False,
+        limit: Optional[int] = None,
+        id_prefix: Optional[str] = None,
+        name_prefix: Optional[str] = None,
+        reverse: bool = False,
+        submit_token: Optional[str] = None,
+        **kwargs,
+    ) -> List[dict]:
+        """Get the job info from the server.
+
+        Args:
+            detailed (bool): True to get the detailed information for each job, False by default
+            limit (int, optional): maximum number of jobs to show, with 0 or None to show all (defaults to None to show all)
+            id_prefix (str): if included, only return jobs with the beginning of the job ID matching the id_prefix
+            name_prefix (str): if included, only return jobs with the beginning of the job name matching the name_prefix
+            reverse (bool): if specified, list jobs in the reverse order of submission times
+            submit_token: optional retry-safe submit token to resolve the submitted job
+            **kwargs: deprecated legacy aliases accepted for compatibility
+
+        Returns: a list of job metadata
+
+        """
+        legacy_aliases = {
+            "max_num": "limit",
+            "job_id_prefix": "id_prefix",
+            "job_name_prefix": "name_prefix",
+            "id": "id_prefix",
+            "name": "name_prefix",
+        }
+        for legacy_key, canonical_key in legacy_aliases.items():
+            if legacy_key not in kwargs:
+                continue
+            value = kwargs.pop(legacy_key)
+            if canonical_key == "limit" and limit is None:
+                limit = value
+            elif canonical_key == "id_prefix" and id_prefix is None:
+                id_prefix = value
+            elif canonical_key == "name_prefix" and name_prefix is None:
+                name_prefix = value
+
+        if kwargs:
+            raise TypeError(f"unsupported list_jobs kwargs: {sorted(kwargs.keys())}")
+
+        if not isinstance(detailed, bool):
+            raise ValueError(f"detailed must be bool but got {type(detailed)}")
+        if not isinstance(reverse, bool):
+            raise ValueError(f"reverse must be bool but got {type(reverse)}")
+        if limit is not None and not isinstance(limit, int):
+            raise ValueError(f"limit must be None or int but got {type(limit)}")
+        if id_prefix is not None and not isinstance(id_prefix, str):
+            raise ValueError(f"id_prefix must be None or str but got {type(id_prefix)}")
+        if name_prefix is not None and not isinstance(name_prefix, str):
+            raise ValueError(f"name_prefix must be None or str but got {type(name_prefix)}")
+        submit_token = _validate_submit_token_arg(submit_token)
+
+        parts = [AdminCommandNames.LIST_JOBS]
+        if detailed:
+            parts.append("-d")
+        if reverse:
+            parts.append("-r")
+        if limit:
+            if not isinstance(limit, int):
+                raise InvalidArgumentError(f"limit must be int but got {type(limit)}")
+            parts.extend(["-m", str(limit)])
+        if name_prefix:
+            if not isinstance(name_prefix, str):
+                raise InvalidArgumentError("name_prefix must be str but got {}.".format(type(name_prefix)))
+            parts.extend(["-n", name_prefix])
+        if id_prefix:
+            if not isinstance(id_prefix, str):
+                raise InvalidArgumentError("id_prefix must be str but got {}.".format(type(id_prefix)))
+            parts.append(id_prefix)
+        if submit_token:
+            parts.extend(["--submit-token", submit_token])
+        command = join_args(parts)
+        result = self._do_command(command)
+        meta = result[ResultKey.META]
+        jobs_list = meta.get(MetaKey.JOBS, [])
+        return jobs_list
+
+    def download_job_result(self, job_id: str, destination: str = None) -> str:
+        """Download result of the job.
+
+        Args:
+            job_id (str): ID of the job
+            destination (str): optional directory to move the downloaded result into.
+                If not specified, result is left in the download_dir from the admin config.
+
+        Returns: folder path to the location of the job result
+
+        """
+        import shutil
+
+        self._validate_job_id(job_id)
+        result = self._do_command(AdminCommandNames.DOWNLOAD_JOB + " " + job_id)
+        meta = result[ResultKey.META]
+        location = meta.get(MetaKey.LOCATION)
+
+        if destination and location and os.path.exists(location):
+            destination = os.path.abspath(destination)
+            os.makedirs(destination, exist_ok=True)
+            final_path = os.path.join(destination, os.path.basename(location))
+            shutil.move(location, final_path)
+            return final_path
+
+        return location
+
+    def list_job_components(self, job_id: str) -> List[str]:
+        """Get the list of additional job components for the specified job.
+
+        Args:
+            job_id (str): ID of the job
+
+        Returns: a list of the additional job components
+
+        """
+        self._validate_job_id(job_id)
+        result = self._do_command(AdminCommandNames.LIST_JOB + " " + job_id)
+        meta = result[ResultKey.META]
+        job_components_list = meta.get(MetaKey.JOB_COMPONENTS, [])
+        return job_components_list
+
+    def download_job_components(self, job_id: str) -> str:
+        """Download additional job components (e.g., ERRORLOG_site-1) for a specified job.
+
+        Args:
+            job_id (str): ID of the job
+
+        Returns: folder path to the location of the downloaded additional job components
+
+        """
+        self._validate_job_id(job_id)
+        result = self._do_command(AdminCommandNames.DOWNLOAD_JOB_COMPONENTS + " " + job_id)
+        meta = result[ResultKey.META]
+        location = meta.get(MetaKey.LOCATION)
+        return location
+
+    def abort_job(self, job_id: str):
+        """Abort the specified job.
+
+        Args:
+            job_id (str): job to be aborted
+
+        Returns:
+            str: the message from the server
+
+        If the job is already done, no effect;
+        If job is not started yet, it will be cancelled and won't be scheduled.
+        If the job is being executed, it will be aborted.
+
+        """
+        self._validate_job_id(job_id)
+        result = self._do_command(AdminCommandNames.ABORT_JOB + " " + job_id)
+        meta = result[ResultKey.META]
+        status = meta.get(MetaKey.STATUS)
+        info = meta.get(MetaKey.INFO)
+        if status != MetaStatusValue.OK:
+            raise InternalError(f"failed to abort job {job_id}: {status}, {info}")
+        return info
+
+    def delete_job(self, job_id: str):
+        """Delete the specified job completely from the system.
+
+        Args:
+            job_id (str): job to be deleted
+
+        Returns:
+            A dict with the deleted job id and submit-token records marked deleted.
+
+        The job will be deleted from the job store if the job is not currently running.
+
+        """
+        self._validate_job_id(job_id)
+        result = self._do_command(AdminCommandNames.DELETE_JOB + " " + job_id)
+        meta = result[ResultKey.META]
+        return {
+            "job_id": meta.get(MetaKey.JOB_ID, job_id),
+            "submit_records_marked_deleted": meta.get("submit_records_marked_deleted", 0),
+        }
+
+    def get_system_info(self):
+        """Get general system information.
+
+        Returns: a SystemInfo object
+
+        """
+        return self._do_get_system_info(AdminCommandNames.CHECK_STATUS)
+
+    def _do_get_system_info(self, cmd: str):
+        result = self._do_command(f"{cmd} {TargetType.SERVER}")
+        meta = result[ResultKey.META]
+        server_info = ServerInfo(status=meta.get(MetaKey.SERVER_STATUS), start_time=meta.get(MetaKey.SERVER_START_TIME))
+
+        clients = []
+        client_meta_list = meta.get(MetaKey.CLIENTS, None)
+        if client_meta_list:
+            for c in client_meta_list:
+                client_info = ClientInfo(
+                    name=c.get(MetaKey.CLIENT_NAME), last_connect_time=c.get(MetaKey.CLIENT_LAST_CONNECT_TIME)
+                )
+                clients.append(client_info)
+
+        jobs = []
+        job_meta_list = meta.get(MetaKey.JOBS, None)
+        if job_meta_list:
+            for j in job_meta_list:
+                job_info = JobInfo(app_name=j.get(MetaKey.APP_NAME), job_id=j.get(MetaKey.JOB_ID))
+                jobs.append(job_info)
+
+        return SystemInfo(server_info=server_info, client_info=clients, job_info=jobs)
+
+    def get_client_job_status(self, client_names: List[str] = None) -> List[dict]:
+        """Get job status info of specified FL clients.
+
+        Args:
+            client_names (List[str]): names of the clients to get status info
+
+        Returns: A list of jobs running on the clients. Each job is described by a dict of: id, app name and status.
+        If there are multiple jobs running on one client, the list contains one entry for each job for that client.
+        If no FL clients are connected or the server failed to communicate to them, this method returns None.
+
+        """
+        parts = [AdminCommandNames.CHECK_STATUS, TargetType.CLIENT]
+        if client_names:
+            _validate_target_strs(client_names)
+            parts.extend(client_names)
+
+        command = join_args(parts)
+        result = self._do_command(command)
+        meta = result[ResultKey.META]
+        return meta.get(MetaKey.CLIENT_STATUS, None)
+
+    def _close_ignore_errors(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _new_poll_session(self):
+        return Session(
+            username=self.username,
+            startup_path=self.startup_path,
+            secure_mode=self.secure_mode,
+            debug=self._debug,
+            study=self._study,
+        )
+
+    def _poll_system_info(self, connect_timeout: float):
+        sess = None
+        try:
+            sess = self._new_poll_session()
+            sess.try_connect(connect_timeout)
+            return sess.get_system_info()
+        finally:
+            if sess:
+                sess._close_ignore_errors()
+
+    @staticmethod
+    def _validate_state_change_timeout(timeout: float) -> float:
+        try:
+            timeout = float(timeout)
+        except (TypeError, ValueError) as e:
+            raise ValueError("timeout must be a positive number when wait=True; use wait=False for no-wait") from e
+        if timeout <= 0:
+            raise ValueError("timeout must be a positive number when wait=True; use wait=False for no-wait")
+        return timeout
+
+    def _wait_for_server_down(self, timeout: float):
+        timeout = self._validate_state_change_timeout(timeout)
+        deadline = time.time() + timeout
+        last_error = "server is still reachable"
+        while time.time() < deadline:
+            try:
+                remaining = max(deadline - time.time(), 0.1)
+                sys_info = self._poll_system_info(min(_STATE_CHANGE_CONNECT_TIMEOUT, remaining))
+                last_error = f"server is still reachable: {sys_info.server_info.status}"
+            except NoConnection:
+                return
+            except Exception as e:
+                last_error = str(e)
+            time.sleep(min(_STATE_CHANGE_POLL_INTERVAL, max(deadline - time.time(), 0.0)))
+
+        raise TimeoutError(f"server did not stop within {timeout} seconds; last error: {last_error}")
+
+    def _wait_for_server_restart(self, previous_start_time, timeout: float):
+        timeout = self._validate_state_change_timeout(timeout)
+        deadline = time.time() + timeout
+        seen_down = previous_start_time is None
+        last_error = "server restart has not completed"
+        while time.time() < deadline:
+            try:
+                remaining = max(deadline - time.time(), 0.1)
+                sys_info = self._poll_system_info(min(_STATE_CHANGE_CONNECT_TIMEOUT, remaining))
+                current_start_time = sys_info.server_info.start_time
+                if seen_down or (previous_start_time is not None and current_start_time != previous_start_time):
+                    return sys_info
+                last_error = "server is still running with the previous start time"
+            except NoConnection:
+                seen_down = True
+                last_error = "server is not reachable yet"
+            except Exception as e:
+                last_error = str(e)
+            time.sleep(min(_STATE_CHANGE_POLL_INTERVAL, max(deadline - time.time(), 0.0)))
+
+        raise TimeoutError(f"server did not restart within {timeout} seconds; last error: {last_error}")
+
+    def _client_last_connect_times(self, client_names: Optional[List[str]] = None):
+        sys_info = self.get_system_info()
+        connected = {client.name: client.last_connect_time for client in sys_info.client_info}
+        if client_names:
+            return {client_name: connected.get(client_name) for client_name in client_names}
+        return connected
+
+    def _wait_for_clients_shutdown(self, client_names: Optional[List[str]], timeout: float):
+        timeout = self._validate_state_change_timeout(timeout)
+        deadline = time.time() + timeout
+        target_names = set(client_names or [])
+        last_error = "clients are still connected"
+        while time.time() < deadline:
+            sys_info = self.get_system_info()
+            connected = {client.name for client in sys_info.client_info}
+            remaining = target_names & connected if target_names else connected
+            if not remaining:
+                return
+            last_error = f"clients are still connected: {', '.join(sorted(remaining))}"
+            time.sleep(min(_STATE_CHANGE_POLL_INTERVAL, max(deadline - time.time(), 0.0)))
+
+        raise TimeoutError(f"clients did not stop within {timeout} seconds; last error: {last_error}")
+
+    def _wait_for_clients_restart(self, previous_client_times, timeout: float, use_poll_session: bool = False):
+        if not previous_client_times:
+            return
+
+        timeout = self._validate_state_change_timeout(timeout)
+        deadline = time.time() + timeout
+        expected_names = set(previous_client_times)
+        last_error = "clients have not reconnected yet"
+        while time.time() < deadline:
+            try:
+                if use_poll_session:
+                    remaining = max(deadline - time.time(), 0.1)
+                    sys_info = self._poll_system_info(min(_STATE_CHANGE_CONNECT_TIMEOUT, remaining))
+                else:
+                    sys_info = self.get_system_info()
+            except NoConnection:
+                last_error = "server is not reachable yet"
+                time.sleep(min(_STATE_CHANGE_POLL_INTERVAL, max(deadline - time.time(), 0.0)))
+                continue
+            except Exception as e:
+                last_error = str(e)
+                time.sleep(min(_STATE_CHANGE_POLL_INTERVAL, max(deadline - time.time(), 0.0)))
+                continue
+            connected = {client.name: client.last_connect_time for client in sys_info.client_info}
+            waiting = []
+            for client_name in expected_names:
+                current_time = connected.get(client_name)
+                previous_time = previous_client_times.get(client_name)
+                if previous_time is None:
+                    # Client was not connected before restart; skip — no reconnection to wait for.
+                    continue
+                if current_time is None or current_time == previous_time:
+                    waiting.append(client_name)
+
+            if not waiting:
+                return
+            last_error = f"clients have not reconnected: {', '.join(sorted(waiting))}"
+            time.sleep(min(_STATE_CHANGE_POLL_INTERVAL, max(deadline - time.time(), 0.0)))
+
+        raise TimeoutError(f"clients did not restart within {timeout} seconds; last error: {last_error}")
+
+    def restart(
+        self,
+        target_type: str,
+        client_names: Optional[List[str]] = None,
+        wait: bool = True,
+        timeout: float = _DEFAULT_STATE_CHANGE_TIMEOUT,
+    ) -> dict:
+        """Restart the server, specific clients, or all participants.
+
+        Args:
+            target_type: ``server``, ``client``, or ``all``
+            client_names: when target_type is ``client``, restrict to these clients (empty = all clients)
+
+        Returns: a dict with detailed info about the restart request.
+        """
+        if target_type not in _VALID_TARGET_TYPES:
+            raise ValueError(f"restart target_type must be one of {_VALID_TARGET_TYPES}")
+        if target_type == TargetType.CLIENT and client_names:
+            _validate_target_strs(client_names)
+        if wait:
+            timeout = self._validate_state_change_timeout(timeout)
+
+        previous_server_start_time = None
+        previous_client_times = None
+        if wait:
+            if target_type in (TargetType.SERVER, TargetType.ALL):
+                try:
+                    sys_info = self.get_system_info()
+                    previous_server_start_time = sys_info.server_info.start_time
+                    if target_type == TargetType.ALL:
+                        previous_client_times = {
+                            client.name: client.last_connect_time for client in sys_info.client_info
+                        }
+                except Exception:
+                    previous_server_start_time = None
+                    previous_client_times = None
+            elif target_type == TargetType.CLIENT:
+                previous_client_times = self._client_last_connect_times(client_names)
+
+        parts = [AdminCommandNames.RESTART, target_type]
+        if target_type == TargetType.CLIENT and client_names:
+            parts.extend(client_names)
+
+        command = join_args(parts)
+        result = self._do_command(command)
+        if wait:
+            if target_type in (TargetType.SERVER, TargetType.ALL):
+                self._close_ignore_errors()
+                self._wait_for_server_restart(previous_server_start_time, timeout)
+                if target_type == TargetType.ALL:
+                    self._wait_for_clients_restart(previous_client_times, timeout, use_poll_session=True)
+            else:
+                self._wait_for_clients_restart(previous_client_times, timeout)
+        return result[ResultKey.META]
+
+    def shutdown(
+        self,
+        target_type: str,
+        client_names: Optional[List[str]] = None,
+        wait: bool = True,
+        timeout: float = _DEFAULT_STATE_CHANGE_TIMEOUT,
+    ) -> dict:
+        """Shut down the server, specific clients, or all participants.
+
+        Args:
+            target_type: ``server``, ``client``, or ``all``
+            client_names: when target_type is ``client``, restrict to these clients (empty = all clients)
+
+        Returns: a dict with detailed info about the shutdown request.
+        """
+        if target_type not in _VALID_TARGET_TYPES:
+            raise ValueError(f"shutdown target_type must be one of {_VALID_TARGET_TYPES}")
+        if target_type == TargetType.CLIENT and client_names:
+            _validate_target_strs(client_names)
+        if wait:
+            timeout = self._validate_state_change_timeout(timeout)
+
+        parts = [AdminCommandNames.SHUTDOWN, target_type]
+        if target_type == TargetType.CLIENT and client_names:
+            parts.extend(client_names)
+
+        command = join_args(parts)
+        result = self._do_command(command)
+        if target_type in (TargetType.SERVER, TargetType.ALL):
+            self._close_ignore_errors()
+            if wait:
+                self._wait_for_server_down(timeout)
+        elif wait:
+            self._wait_for_clients_shutdown(client_names, timeout)
+        return result[ResultKey.META]
+
+    def set_timeout(self, value: float):
+        """Set a session-specific command timeout.
+
+        This is the amount of time the server will wait for responses after sending commands to FL clients.
+
+        Note that this value is only effective for the current API session.
+
+        Args:
+            value (float): a positive float number for the timeout in seconds
+
+        Returns: None
+
+        """
+        self.api.set_command_timeout(value)
+
+    def unset_timeout(self):
+        """Unset the session-specific command timeout.
+
+        Once unset, the FL Admin Server's default timeout will be used.
+
+        Returns: None
+
+        """
+        self.api.unset_command_timeout()
+
+    def get_available_apps_to_upload(self):
+        """Get defined FLARE app folders from the upload folder on the machine the FLARE API is running.
+
+        Returns: a list of app folders
+
+        """
+        dir_list = []
+        for item in os.listdir(self.upload_dir):
+            if os.path.isdir(os.path.join(self.upload_dir, item)):
+                dir_list.append(item)
+        return dir_list
+
+    def shutdown_system(self):
+        """Shutdown the whole NVFLARE system including FL server, and all FL clients.
+
+        Returns: None
+
+        Note: the user must be a Project Admin to use this method; otherwise the NOT_AUTHORIZED exception will be raised.
+
+        """
+        self._do_command(f"{AdminCommandNames.SHUTDOWN} {TargetType.ALL}")
+        sys_info = self._do_get_system_info(AdminCommandNames.ADMIN_CHECK_STATUS)
+        if sys_info.server_info.status != "stopped":
+            raise JobNotDone("there are still running jobs")
+
+    def ls_target(self, target: str, options: Optional[str] = None, path: Optional[str] = None) -> str:
+        """Run the "ls" command on the specified target and return the result.
+
+        Args:
+            target: the target (server or a client name) the command will be run on
+            options: options of the "ls" command
+            path: the optional file path
+
+        Returns: result of "ls" command
+
+        """
+        return self._shell_command_on_target("ls", target, options, path)
+
+    def cat_target(self, target: str, options: Optional[str] = None, file: Optional[str] = None) -> str:
+        """Run the "cat" command on the specified target and return the result.
+
+        Args:
+            target: the target (server or a client name) the command will be run on
+            options: options of the "cat" command
+            file: the file that the "cat" command will run against
+
+        Returns: result of "cat" command
+
+        """
+        return self._shell_command_on_target("cat", target, options, file, fp_required=True, fp_type="file")
+
+    def tail_target(self, target: str, options: Optional[str] = None, file: Optional[str] = None) -> str:
+        """Run the "tail" command on the specified target and return the result.
+
+        Args:
+            target: the target (server or a client name) the command will be run on
+            options: options of the "tail" command
+            file: the file that the "tail" command will run against
+
+        Returns: result of "tail" command
+
+        """
+        return self._shell_command_on_target("tail", target, options, file, fp_required=True, fp_type="file")
+
+    def tail_target_log(self, target: str, options: Optional[str] = None) -> str:
+        """Run the "tail log.txt" command on the specified target and return the result.
+
+        Args:
+            target: the target (server or a client name) the command will be run on
+            options: options of the "tail" command
+
+        Returns: result of "tail" command
+
+        """
+        return self.tail_target(target, options, file="log.txt")
+
+    def head_target(self, target: str, options: Optional[str] = None, file: Optional[str] = None) -> str:
+        """Run the "head" command on the specified target and return the result.
+
+        Args:
+            target: the target (server or a client name) the command will be run on
+            options: options of the "head" command
+            file: the file that the "head" command will run against
+
+        Returns: result of "head" command
+
+        """
+        return self._shell_command_on_target("head", target, options, file, fp_required=True, fp_type="file")
+
+    def head_target_log(self, target: str, options: Optional[str] = None) -> str:
+        """Run the "head log.txt" command on the specified target and return the result.
+
+        Args:
+            target: the target (server or a client name) the command will be run on
+            options: options of the "head" command
+
+        Returns: result of "head" command
+
+        """
+        return self.head_target(target, options, file="log.txt")
+
+    def grep_target(
+        self, target: str, options: Optional[str] = None, pattern: Optional[str] = None, file: Optional[str] = None
+    ) -> str:
+        """Run the "grep" command on the specified target and return the result.
+
+        Args:
+            target: the target (server or a client name) the command will be run on
+            options: options of the "grep" command
+            pattern: the grep pattern
+            file: the file that the "grep" command will run against
+
+        Returns: result of "grep" command
+
+        """
+        return self._shell_command_on_target(
+            "grep", target, options, file, pattern=pattern, pattern_required=True, fp_required=True, fp_type="file"
+        )
+
+    def get_working_directory(self, target: str) -> str:
+        """Get the working directory of the specified target.
+
+        Args:
+            target (str): the target (server of a client name)
+
+        Returns: current working directory of the specified target
+
+        """
+        return self._shell_command_on_target("pwd", target, options=None, fp=None)
+
+    def _shell_command_on_target(
+        self,
+        cmd: str,
+        target: str,
+        options,
+        fp,
+        pattern=None,
+        pattern_required=False,
+        fp_required=False,
+        fp_type="path",
+    ) -> str:
+        target = validate_required_target_string(target)
+        parts = [cmd, target]
+        if options:
+            options = validate_options_string(options)
+            parts.append(options)
+
+        if pattern_required:
+            if not pattern:
+                raise SyntaxError("pattern is required but not specified.")
+            if not isinstance(pattern, str):
+                raise ValueError("pattern is not str.")
+            parts.append(pattern)
+
+        if fp_required and not fp:
+            raise SyntaxError(f"{fp_type} is required but not specified.")
+
+        if fp:
+            if fp_type == "path":
+                validate_path_string(fp)
+            else:
+                validate_file_string(fp)
+            parts.append(fp)
+        command = join_args(parts)
+        reply = self._do_command(command, enforce_meta=False)
+        return self._get_string_data(reply)
+
+    @staticmethod
+    def _get_string_data(reply: dict) -> str:
+        result = ""
+        data_items = reply.get(ProtoKey.DATA, [])
+        for it in data_items:
+            if isinstance(it, dict):
+                if it.get(ProtoKey.TYPE) == ProtoKey.STRING:
+                    result += it.get(ProtoKey.DATA, "")
+        return result
+
+    @staticmethod
+    def _get_dict_data(reply: dict) -> dict:
+        result = {}
+        data_items = reply.get(ProtoKey.DATA, [])
+        for it in data_items:
+            if isinstance(it, dict):
+                if it.get(ProtoKey.TYPE) == ProtoKey.DICT:
+                    return it.get(ProtoKey.DATA, {})
+        return result
+
+    @staticmethod
+    def _get_study_payload(reply: dict) -> dict:
+        payload = Session._get_dict_data(reply)
+        if not isinstance(payload, dict):
+            raise InternalError(f"study payload must be dict but got {type(payload)}")
+        error_code = payload.get("error_code")
+        if error_code:
+            raise CommandError(
+                error_code=error_code,
+                message=payload.get("message", error_code),
+                hint=payload.get("hint", ""),
+                exit_code=payload.get("exit_code", 1),
+            )
+        return payload
+
+    @staticmethod
+    def _validate_study_name(study: str):
+        if not isinstance(study, str):
+            raise InvalidArgumentError(f"study must be str but got {type(study)}")
+        if not study:
+            raise InvalidArgumentError("study is required but not specified.")
+
+    @staticmethod
+    def _validate_study_sites(sites: List[str]):
+        if not isinstance(sites, list):
+            raise InvalidArgumentError(f"sites must be list but got {type(sites)}")
+        if not sites:
+            raise InvalidArgumentError("sites are required but not specified.")
+        for site in sites:
+            if not isinstance(site, str) or not site:
+                raise InvalidArgumentError(f"invalid site value: {site}")
+
+    @staticmethod
+    def _validate_study_user(user: str):
+        if not isinstance(user, str):
+            raise InvalidArgumentError(f"user must be str but got {type(user)}")
+        if not user:
+            raise InvalidArgumentError("user is required but not specified.")
+
+    @staticmethod
+    def _validate_study_site_orgs(site_orgs: List[str]):
+        if not isinstance(site_orgs, list):
+            raise InvalidArgumentError(f"site_orgs must be list but got {type(site_orgs)}")
+        if not site_orgs:
+            raise InvalidArgumentError("site_orgs are required but not specified.")
+        for item in site_orgs:
+            if not isinstance(item, str) or not item:
+                raise InvalidArgumentError(f"invalid site_org value: {item}")
+
+    def register_study(
+        self, study: str, sites: Optional[List[str]] = None, site_orgs: Optional[List[str]] = None
+    ) -> dict:
+        self._validate_study_name(study)
+        if sites and site_orgs:
+            raise InvalidArgumentError("sites and site_orgs are mutually exclusive; provide only one")
+        parts = [AdminCommandNames.REGISTER_STUDY, study]
+        if site_orgs:
+            self._validate_study_site_orgs(site_orgs)
+            for item in site_orgs:
+                parts.extend(["--site-org", item])
+        else:
+            self._validate_study_sites(sites)
+            parts.extend(["--sites", ",".join(sites)])
+        reply = self._do_command(join_args(parts))
+        return self._get_study_payload(reply)
+
+    def add_study_site(
+        self, study: str, sites: Optional[List[str]] = None, site_orgs: Optional[List[str]] = None
+    ) -> dict:
+        self._validate_study_name(study)
+        if sites and site_orgs:
+            raise InvalidArgumentError("sites and site_orgs are mutually exclusive; provide only one")
+        parts = [AdminCommandNames.ADD_STUDY_SITE, study]
+        if site_orgs:
+            self._validate_study_site_orgs(site_orgs)
+            for item in site_orgs:
+                parts.extend(["--site-org", item])
+        else:
+            self._validate_study_sites(sites)
+            parts.extend(["--sites", ",".join(sites)])
+        reply = self._do_command(join_args(parts))
+        return self._get_study_payload(reply)
+
+    def remove_study_site(
+        self, study: str, sites: Optional[List[str]] = None, site_orgs: Optional[List[str]] = None
+    ) -> dict:
+        self._validate_study_name(study)
+        if sites and site_orgs:
+            raise InvalidArgumentError("sites and site_orgs are mutually exclusive; provide only one")
+        parts = [AdminCommandNames.REMOVE_STUDY_SITE, study]
+        if site_orgs:
+            self._validate_study_site_orgs(site_orgs)
+            for item in site_orgs:
+                parts.extend(["--site-org", item])
+        else:
+            self._validate_study_sites(sites)
+            parts.extend(["--sites", ",".join(sites)])
+        reply = self._do_command(join_args(parts))
+        return self._get_study_payload(reply)
+
+    def remove_study(self, study: str) -> dict:
+        self._validate_study_name(study)
+        reply = self._do_command(join_args([AdminCommandNames.REMOVE_STUDY, study]))
+        return self._get_study_payload(reply)
+
+    def list_studies(self) -> dict:
+        reply = self._do_command(AdminCommandNames.LIST_STUDIES)
+        return self._get_study_payload(reply)
+
+    def show_study(self, study: str) -> dict:
+        self._validate_study_name(study)
+        reply = self._do_command(join_args([AdminCommandNames.SHOW_STUDY, study]))
+        return self._get_study_payload(reply)
+
+    def add_study_user(self, study: str, user: str) -> dict:
+        self._validate_study_name(study)
+        self._validate_study_user(user)
+        reply = self._do_command(join_args([AdminCommandNames.ADD_STUDY_USER, study, user]))
+        return self._get_study_payload(reply)
+
+    def remove_study_user(self, study: str, user: str) -> dict:
+        self._validate_study_name(study)
+        self._validate_study_user(user)
+        reply = self._do_command(join_args([AdminCommandNames.REMOVE_STUDY_USER, study, user]))
+        return self._get_study_payload(reply)
+
+    def show_stats(self, job_id: str, target_type: str, targets: Optional[List[str]] = None) -> dict:
+        """Show processing stats of specified job on specified targets.
+
+        Args:
+            job_id (str): ID of the job
+            target_type (str): type of target (server or client)
+            targets: list of client names if target type is "client". All clients if not specified.
+
+        Returns: a dict that contains job stats on specified targets. The key of the dict is target name. The value is
+        a dict of stats reported by different system components (ServerRunner or ClientRunner).
+
+        """
+        return self._collect_info(AdminCommandNames.SHOW_STATS, job_id, target_type, targets)
+
+    def show_errors(self, job_id: str, target_type: str, targets: Optional[List[str]] = None) -> dict:
+        """Show processing errors of specified job on specified targets.
+
+        Args:
+            job_id (str): ID of the job
+            target_type (str): type of target (server or client)
+            targets: list of client names if target type is "client". All clients if not specified.
+
+        Returns: a dict that contains job errors (if any) on specified targets. The key of the dict is target name.
+        The value is a dict of errors reported by different system components (ServerRunner or ClientRunner).
+
+        """
+        return self._collect_info(AdminCommandNames.SHOW_ERRORS, job_id, target_type, targets)
+
+    def reset_errors(self, job_id: str):
+        """Clear errors for all system targets for the specified job.
+
+        Args:
+            job_id (str): ID of the job
+
+        Returns: None
+
+        """
+        self._collect_info(AdminCommandNames.RESET_ERRORS, job_id, TargetType.ALL)
+
+    def _collect_info(self, cmd: str, job_id: str, target_type: str, targets=None) -> dict:
+        if not isinstance(job_id, str):
+            raise TypeError("job_id must be str but got {}.".format(type(job_id)))
+
+        if not job_id:
+            raise ValueError("job_id is required but not specified.")
+
+        if target_type not in _VALID_TARGET_TYPES:
+            raise ValueError(f"invalid target_type {target_type}: must be one of {_VALID_TARGET_TYPES}")
+
+        parts = [cmd, job_id, target_type]
+        if target_type == TargetType.CLIENT and targets:
+            _validate_target_strs(targets)
+            parts.extend(targets)
+
+        command = join_args(parts)
+        reply = self._do_command(command, enforce_meta=False)
+        return self._get_dict_data(reply)
+
+    def check_status(self, target_type: str, targets=None) -> dict:
+        """Get status of specified system target(s).
+
+        Args:
+            target_type (str): type of target (server, client, or all)
+            targets: list of client names if target type is "client". All clients if not specified.
+
+        Returns: a dict with status information
+
+        """
+        if target_type not in _VALID_TARGET_TYPES:
+            raise ValueError(f"invalid target_type {target_type} - must be in {_VALID_TARGET_TYPES}")
+
+        parts = [AdminCommandNames.CHECK_STATUS, target_type]
+        if target_type == TargetType.CLIENT and targets:
+            _validate_target_strs(targets)
+            parts.extend(targets)
+
+        command = join_args(parts)
+        result = self._do_command(command)
+        return result[ResultKey.META]
+
+    def report_resources(self, target_type: str, targets=None) -> dict:
+        """Report resources of specified system target(s).
+
+        Args:
+            target_type (str): type of target (server, client, or all)
+            targets: list of client names if target type is "client". All clients if not specified.
+
+        Returns: a dict with resource information.
+
+        Notes:
+            The underlying admin protocol currently returns this data as a table-shaped payload.
+            Session normalizes the current table layout into a simpler site->value dict for CLI
+            consumers. If the server-side table shape changes in the future, this adapter needs to
+            be updated alongside that protocol change.
+
+        """
+        if target_type not in _VALID_TARGET_TYPES:
+            raise ValueError(f"invalid target_type {target_type} - must be in {_VALID_TARGET_TYPES}")
+
+        parts = [AdminCommandNames.REPORT_RESOURCES, target_type]
+        if target_type == TargetType.CLIENT and targets:
+            _validate_target_strs(targets)
+            parts.extend(targets)
+
+        command = " ".join(parts)
+        result = self._do_command(command, enforce_meta=False)
+        data_items = result.get(ProtoKey.DATA, [])
+        resources = {}
+        for item in data_items:
+            if isinstance(item, dict) and item.get(ProtoKey.TYPE) == ProtoKey.TABLE:
+                rows = item.get(ProtoKey.ROWS, [])
+                if not rows or len(rows) < 2:
+                    continue
+                for row in rows[1:]:
+                    if isinstance(row, list) and len(row) >= 2:
+                        resources[str(row[0])] = row[1]
+        return resources
+
+    def report_version(self, target_type: str, targets: Optional[List[str]] = None) -> dict:
+        """Report NVFlare version for specified system target(s).
+
+        Args:
+            target_type (str): type of target (server, client, or all)
+            targets: list of client names if target type is "client". All clients if not specified.
+
+        Returns: a dict with version information per site
+
+        """
+        if target_type not in _VALID_TARGET_TYPES:
+            raise ValueError(f"invalid target_type {target_type} - must be in {_VALID_TARGET_TYPES}")
+
+        parts = [AdminCommandNames.REPORT_VERSION, target_type]
+        if target_type == TargetType.CLIENT and targets:
+            _validate_target_strs(targets)
+            parts.extend(targets)
+
+        command = " ".join(parts)
+        reply = self._do_command(command, enforce_meta=False)
+        return self._get_dict_data(reply)
+
+    def remove_client(self, client_name: str) -> None:
+        """Release a connected client's active token.
+
+        Args:
+            client_name (str): name of the client whose active token should be released
+
+        Returns: None
+
+        Note:
+            This does not stop the client, revoke credentials, or prevent reconnect.
+            Use disable_client to prevent a client from reconnecting.
+        """
+        if not client_name or not isinstance(client_name, str):
+            raise ValueError("client_name must be a non-empty str")
+
+        self._do_command(join_args([AdminCommandNames.REMOVE_CLIENT, client_name]))
+
+    def disable_client(self, client_name: str) -> dict:
+        """Disable a client from reconnecting to the system.
+
+        Args:
+            client_name (str): name of the client to disable
+
+        Returns: command result dictionary
+
+        """
+        if not client_name or not isinstance(client_name, str):
+            raise ValueError("client_name must be a non-empty str")
+
+        reply = self._do_command(join_args([AdminCommandNames.DISABLE_CLIENT, client_name]))
+        return self._get_dict_data(reply)
+
+    def enable_client(self, client_name: str) -> dict:
+        """Enable a disabled client to reconnect to the system.
+
+        Args:
+            client_name (str): name of the client to enable
+
+        Returns: command result dictionary
+
+        """
+        if not client_name or not isinstance(client_name, str):
+            raise ValueError("client_name must be a non-empty str")
+
+        reply = self._do_command(join_args([AdminCommandNames.ENABLE_CLIENT, client_name]))
+        return self._get_dict_data(reply)
+
+    @staticmethod
+    def _filter_job_log_text(log_text: str, tail_lines: Optional[int], grep_pattern: Optional[str]) -> str:
+        lines = log_text.splitlines(keepends=True)
+        if tail_lines is not None:
+            try:
+                line_count = int(tail_lines)
+            except (TypeError, ValueError) as e:
+                raise ValueError("tail_lines must be an integer") from e
+            if line_count < 0:
+                raise ValueError("tail_lines must be greater than or equal to 0")
+            lines = lines[-line_count:] if line_count else []
+        if grep_pattern:
+            pattern = str(grep_pattern)
+            lines = [line for line in lines if pattern in line]
+        return "".join(lines)
+
+    @classmethod
+    def _filter_job_logs_payload(cls, result: dict, tail_lines: Optional[int], grep_pattern: Optional[str]) -> dict:
+        if tail_lines is None and not grep_pattern:
+            return result
+
+        logs = result.get("logs")
+        if not isinstance(logs, dict):
+            return result
+
+        filtered_logs = {}
+        for site_name, log_text in logs.items():
+            if isinstance(log_text, str):
+                filtered_logs[site_name] = cls._filter_job_log_text(log_text, tail_lines, grep_pattern)
+            else:
+                filtered_logs[site_name] = log_text
+
+        filtered_result = dict(result)
+        filtered_result["logs"] = filtered_logs
+        return filtered_result
+
+    def get_job_logs(
+        self,
+        job_id: str,
+        target: str = "server",
+        tail_lines: Optional[int] = None,
+        grep_pattern: Optional[str] = None,
+        log_file_name: str = WorkspaceConstants.LOG_FILE_NAME,
+    ) -> dict:
+        """Retrieve job logs from the server-side log store.
+
+        Args:
+            job_id (str): ID of the job
+            target (str): "server", "all", or a client site name
+            tail_lines (int, optional): deprecated compatibility filter that returns only the last N lines
+            grep_pattern (str, optional): deprecated compatibility filter that returns matching lines
+            log_file_name (str): internal log file selector. Defaults to log.txt.
+
+        Returns: dict with "logs" mapping site name to log text, and optional
+            "unavailable" mapping site names to reasons.
+
+        """
+        self._validate_job_id(job_id)
+        if not isinstance(target, str) or not target:
+            raise ValueError("target must be a non-empty str")
+
+        parts = [AdminCommandNames.GET_JOB_LOG, job_id, target]
+        if log_file_name != WorkspaceConstants.LOG_FILE_NAME:
+            parts.append(log_file_name)
+        command = join_args(parts)
+        try:
+            reply = self._do_command(command, enforce_meta=False)
+        except InternalError as e:
+            if log_file_name != WorkspaceConstants.LOG_FILE_NAME and "unrecognized arguments" in str(e):
+                return {"logs": {}}
+            raise
+        payload = self._get_dict_data(reply)
+        if isinstance(payload, dict) and "logs" in payload:
+            result = {"logs": payload.get("logs", {})}
+            if "unavailable" in payload:
+                result["unavailable"] = payload.get("unavailable", {})
+            return self._filter_job_logs_payload(result, tail_lines, grep_pattern)
+        return self._filter_job_logs_payload({"logs": payload}, tail_lines, grep_pattern)
+
+    def configure_job_log(self, job_id: str, config, target: str = "all") -> None:
+        """Configure logging for a running job.
+
+        Args:
+            job_id (str): ID of the job (must be RUNNING)
+            config: str log level or built-in LogMode
+            target (str): "all", "server", or a client site name. Any value
+                other than "all" or "server" is sent through the client-targeted
+                admin command path.
+
+        Returns: None
+
+        """
+        self._validate_job_id(job_id)
+        if isinstance(config, dict):
+            config_str = json.dumps(config)
+        else:
+            config_str = str(config)
+
+        parts = [AdminCommandNames.CONFIGURE_JOB_LOG, job_id]
+        if target in ("all", "server"):
+            parts.append(target)
+        else:
+            parts.extend(["client", target])
+        parts.append(config_str)
+        command = join_args(parts)
+        self._do_command(command, enforce_meta=False)
+
+    def configure_site_log(self, config, target: str = "all") -> None:
+        """Configure site-level logging.
+
+        Args:
+            config: str log level or built-in LogMode
+            target (str): target site name or "all"
+
+        Returns: None
+
+        """
+        config_str = validate_site_log_config(config)
+
+        command = join_args([AdminCommandNames.CONFIGURE_SITE_LOG, target, config_str])
+        self._do_command(command, enforce_meta=False)
+
+    def wait_for_job(self, job_id: str, timeout: float = 0.0, poll_interval: float = 2.0) -> dict:
+        """Block until job reaches a terminal state.
+
+        Args:
+            job_id (str): ID of the job to wait for
+            timeout (float): how long to wait; 0 means wait indefinitely
+            poll_interval (float): seconds between status polls
+
+        Returns: final job meta dict
+
+        Raises: JobTimeout if timeout is exceeded before job finishes
+
+        """
+        rc, job_meta = self.monitor_job_and_return_job_meta(job_id, timeout=timeout, poll_interval=poll_interval)
+        if rc == MonitorReturnCode.TIMEOUT:
+            raise JobTimeout(f"job {job_id} did not finish within {timeout}s")
+        return job_meta
+
+    def do_app_command(self, job_id: str, topic: str, cmd_data) -> dict:
+        """Ask a running job to execute an app command
+
+        Args:
+            job_id: the ID of the running job
+            topic: topic of the command
+            cmd_data: the data of the command. Must be JSON serializable.
+
+        Returns: result of the app command
+
+        If the job is not currently running, an exception will occur. User must make sure that the job is running when
+        calling this method.
+
+        """
+        command = f"{AdminCommandNames.APP_COMMAND} {job_id} {topic}"
+        if cmd_data:
+            # cmd_data must be JSON serializable!
+            try:
+                json.dumps(cmd_data)
+            except Exception as ex:
+                raise ValueError(f"cmd_data cannot be JSON serialized: {ex}")
+        reply = self._do_command(command, enforce_meta=False, props=cmd_data)
+        return self._get_dict_data(reply)
+
+    def get_connected_client_list(self) -> List[ClientInfo]:
+        """Get the list of connected clients.
+
+        Returns: a list of ClientInfo objects
+
+        """
+        sys_info = self.get_system_info()
+        return sys_info.client_info
+
+    def get_client_env(self, client_names=None):
+        """Get running environment values for specified clients. The env includes values of client name,
+        workspace directory, root url of the FL server, and secure mode or not.
+
+        These values can be used for third-party system configuration.
+
+        Args:
+            client_names: clients to get env from. None means all clients.
+
+        Returns: list of env info for specified clients.
+
+        Raises: InvalidTarget exception, if no clients are connected or an invalid client name is specified
+
+        """
+        if not client_names:
+            command = AdminCommandNames.REPORT_ENV
+        else:
+            if isinstance(client_names, str):
+                client_names = [client_names]
+            elif not isinstance(client_names, list):
+                raise ValueError(f"client_names must be str or list of str but got {type(client_names)}")
+            command = AdminCommandNames.REPORT_ENV + " " + " ".join(client_names)
+
+        result = self._do_command(command)
+        meta = result[ResultKey.META]
+        client_envs = meta.get(MetaKey.CLIENTS)
+        if not client_envs:
+            raise RuntimeError(f"missing {MetaKey.CLIENTS} from meta")
+        return client_envs
+
+    def do_command(self, command: str, props=None):
+        """Execute an admin command.
+
+        Args:
+            command: the command to be executed
+            props: extra properties passed with the command
+
+        Returns:
+
+        """
+        return self.api.do_command(command, props)
+
+    def get_job_status(self, job_id: str) -> Optional[str]:
+        """Get the status of a job.
+
+        Args:
+            job_id: ID of the job
+
+        Returns: status of the job
+
+        """
+        job_meta = self.get_job_meta(job_id)
+        if job_meta:
+            return job_meta.get(JobMetaKey.STATUS.value)
+        else:
+            return None
+
+    def monitor_job_and_return_job_meta(
+        self, job_id: str, timeout: float = 0.0, poll_interval: float = 2.0, cb=None, *cb_args, **cb_kwargs
+    ) -> (MonitorReturnCode, Optional[dict]):
+        """Monitor the job progress.
+
+        Monitors until one of the conditions occurs:
+            - job is done
+            - timeout
+            - the status_cb returns False
+
+        Args:
+            job_id (str): the job to be monitored
+            timeout (float): how long to monitor. If 0, never time out.
+            poll_interval (float): how often to poll job status
+            cb: if provided, callback to be called after each status poll
+
+        Returns: a tuple of (MonitorReturnCode, job meta dict)
+
+        Every time the cb is called, it must return a bool indicating whether the monitor
+        should continue. If False, this method ends.
+
+        """
+        _validate_job_polling_options(timeout, poll_interval)
+        start_time = time.time()
+        while True:
+            if 0 < timeout < time.time() - start_time:
+                return MonitorReturnCode.TIMEOUT, None
+
+            job_meta = self.get_job_meta(job_id)
+            if cb is not None:
+                should_continue = cb(self, job_id, job_meta, *cb_args, **cb_kwargs)
+                if not should_continue:
+                    return MonitorReturnCode.ENDED_BY_CB, None
+
+            # check whether the job is finished
+            job_status = job_meta.get(JobMetaKey.STATUS.value, None)
+            if not job_status:
+                raise InternalError(f"missing status in job {job_id}")
+
+            if _is_terminal_job_status(job_status):
+                return MonitorReturnCode.JOB_FINISHED, job_meta
+
+            time.sleep(poll_interval)
+
+
+def basic_cb_with_print(session: Session, job_id: str, job_meta, *cb_args, **cb_kwargs) -> bool:
+    """This is a sample callback to use with monitor_job.
+
+    This demonstrates how a custom callback can be used.
+
+    When the CLI output helper is available, use it so human progress updates follow the CLI
+    stdout/stderr routing policy. Non-CLI callers still get a plain print() fallback.
+
+    """
+    try:
+        from nvflare.tool.cli_output import print_human as _emit
+    except ImportError:
+        _emit = print
+
+    if job_meta["status"] == "RUNNING":
+        if cb_kwargs["cb_run_counter"]["count"] < 3:
+            _emit(job_meta)
+        else:
+            _emit(".", end="")
+    else:
+        _emit("\n" + str(job_meta))
+
+    cb_kwargs["cb_run_counter"]["count"] += 1
+    return True
+
+
+def new_session(
+    username: str,
+    startup_kit_location: str,
+    secure_mode: bool = True,
+    debug: bool = False,
+    timeout: float = 10.0,
+    study: str = DEFAULT_STUDY,
+    command_timeout: float = None,
+    auto_login_max_tries: int = None,
+) -> Session:
+    session = Session(
+        username=username,
+        startup_path=startup_kit_location,
+        debug=debug,
+        secure_mode=secure_mode,
+        study=study,
+    )
+    if auto_login_max_tries is not None and getattr(session, "api", None):
+        session.api.auto_login_max_tries = auto_login_max_tries
+    if command_timeout is not None:
+        session.set_timeout(command_timeout)
+    try:
+        session.try_connect(timeout)
+        return session
+    except Exception:
+        try:
+            session.close()
+        except Exception as cleanup_error:
+            # Preserve the original connection/setup failure if cleanup on a partially
+            # initialized session also errors.
+            logger = get_obj_logger(session)
+            if logger:
+                logger.debug("failed to close partially initialized session during cleanup: %s", cleanup_error)
+        raise
+
+
+def new_secure_session(
+    username: str,
+    startup_kit_location: str,
+    debug: bool = False,
+    timeout: float = 10.0,
+    study: str = DEFAULT_STUDY,
+    command_timeout: float = None,
+    auto_login_max_tries: int = None,
+) -> Session:
+    """Create a new secure FLARE API session with the NVFLARE system.
+
+    Args:
+        username (str): username assigned to the user
+        startup_kit_location (str): path to the provisioned startup folder, the root admin dir containing the startup folder
+        debug (bool): enable debug mode
+        timeout (float): how long to try to establish the session, in seconds
+        study (str): active study context for submitted jobs and session-scoped job listing; defaults to "default"
+        command_timeout (float): optional per-session command timeout sent to the admin server
+        auto_login_max_tries (int): optional cap on API auto-login retries before connect
+
+    Returns: a Session object
+
+    """
+    return new_session(
+        username,
+        startup_kit_location,
+        True,
+        debug,
+        timeout,
+        study=study,
+        command_timeout=command_timeout,
+        auto_login_max_tries=auto_login_max_tries,
+    )
+
+
+def new_insecure_session(
+    startup_kit_location: str,
+    debug: bool = False,
+    timeout: float = 10.0,
+    study: str = DEFAULT_STUDY,
+) -> Session:
+    """Create a new insecure FLARE API session with the NVFLARE system.
+
+    Args:
+        startup_kit_location (str): path to the provisioned startup folder
+        debug (bool): enable debug mode
+        timeout (float): how long to try to establish the session, in seconds
+        study (str): active study context for submitted jobs and session-scoped job listing; defaults to "default"
+
+    Returns: a Session object
+
+    The username for insecure session is always "admin".
+
+    """
+    return new_session(
+        username="",
+        startup_kit_location=startup_kit_location,
+        secure_mode=False,
+        debug=debug,
+        timeout=timeout,
+        study=study,
+    )

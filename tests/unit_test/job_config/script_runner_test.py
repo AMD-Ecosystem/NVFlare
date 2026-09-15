@@ -1,0 +1,753 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import json
+import os
+import sys
+import tempfile
+from unittest.mock import Mock, patch
+
+import pytest
+
+from nvflare.apis.job_def import SERVER_SITE_NAME, JobMetaKey
+from nvflare.client.config import ExchangeFormat, TransferType
+from nvflare.job_config.script_runner import FrameworkType, ScriptRunner
+
+
+class TestScriptRunner:
+    """Test cases for ScriptRunner class with launch_once and shutdown_timeout parameters."""
+
+    @pytest.fixture
+    def mock_file_system(self):
+        """Mock file system operations."""
+        with patch("os.path.isfile", return_value=True), patch("os.path.exists", return_value=True):
+            yield
+
+    @pytest.fixture
+    def base_script_runner_params(self):
+        """Base parameters for creating ScriptRunner instances."""
+        return {
+            "script": "train.py",
+            "script_args": "--epochs 10",
+            "framework": FrameworkType.PYTORCH,
+        }
+
+    def test_default_launch_once_and_shutdown_timeout(self, base_script_runner_params):
+        """Test that launch_once defaults to True and shutdown_timeout defaults to 0.0."""
+        runner = ScriptRunner(**base_script_runner_params)
+
+        assert runner._launch_once is True
+        assert runner._shutdown_timeout == 0.0
+
+    @pytest.mark.parametrize(
+        "launch_once,shutdown_timeout",
+        [
+            (True, 0.0),  # Default values
+            (False, 0.0),  # launch_once=False with default timeout
+            (True, 10.0),  # launch_once=True with custom timeout
+            (False, 15.0),  # launch_once=False with custom timeout
+            (True, 100.0),  # Large timeout value
+        ],
+    )
+    def test_launch_once_and_shutdown_timeout_configurations(
+        self, base_script_runner_params, launch_once, shutdown_timeout
+    ):
+        """Test various launch_once and shutdown_timeout configurations."""
+        runner = ScriptRunner(
+            launch_external_process=True,
+            launch_once=launch_once,
+            shutdown_timeout=shutdown_timeout,
+            **base_script_runner_params,
+        )
+
+        assert runner._launch_once == launch_once
+        assert runner._shutdown_timeout == shutdown_timeout
+        assert runner._launch_external_process is True
+
+    def test_in_process_with_launch_parameters(self, base_script_runner_params):
+        """Test that launch parameters can be set even in in-process mode."""
+        runner = ScriptRunner(
+            launch_external_process=False,  # In-process mode
+            launch_once=False,
+            shutdown_timeout=10.0,
+            **base_script_runner_params,
+        )
+
+        # Values should be stored even though they won't be used in in-process mode
+        assert runner._launch_once is False
+        assert runner._shutdown_timeout == 10.0
+        assert runner._launch_external_process is False
+
+    def test_subprocess_launcher_creation_with_default_values(self, mock_file_system, base_script_runner_params):
+        """Test default external-process launch settings."""
+        runner = ScriptRunner(launch_external_process=True, **base_script_runner_params)
+
+        # Verify the runner stores default values
+        assert runner._launch_once is True
+        assert runner._shutdown_timeout == 0.0
+
+    def test_subprocess_launcher_creation_with_custom_values(self, mock_file_system, base_script_runner_params):
+        """Test custom external-process launch settings."""
+        runner = ScriptRunner(
+            launch_external_process=True, launch_once=False, shutdown_timeout=20.0, **base_script_runner_params
+        )
+
+        # Verify the runner stores custom values
+        assert runner._launch_once is False
+        assert runner._shutdown_timeout == 20.0
+
+    def test_exported_job_contains_launch_parameters(self, base_script_runner_params):
+        """Test that exported job configuration contains launch_once and shutdown_timeout parameters."""
+        from nvflare.app_common.workflows.scatter_and_gather import ScatterAndGather
+        from nvflare.job_config.api import FedJob
+
+        # Create a temporary script file
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as script_file:
+            script_file.write("# Dummy training script for testing\n")
+            script_path = script_file.name
+
+        try:
+            runner = ScriptRunner(
+                script=script_path,
+                script_args="--epochs 10",
+                launch_external_process=True,
+                launch_once=False,
+                shutdown_timeout=25.0,
+                framework=base_script_runner_params["framework"],
+            )
+
+            job = FedJob(name="test_launch_params_job")
+
+            # Add a minimal server component (required for export)
+            controller = ScatterAndGather(
+                min_clients=1,
+                num_rounds=1,
+                wait_time_after_min_received=0,
+            )
+            job.to_server(controller)
+
+            # Add the runner to clients
+            job.to_clients(runner)
+
+            # Export the job
+            with tempfile.TemporaryDirectory() as temp_dir:
+                job.export_job(temp_dir)
+
+                # Check client config - use safer path construction
+                client_config_path = os.path.join(
+                    temp_dir, "test_launch_params_job", "app", "config", "config_fed_client.json"
+                )
+
+                assert os.path.exists(client_config_path), f"Client config not found at {client_config_path}"
+
+                with open(client_config_path, "r") as f:
+                    client_config = json.load(f)
+
+                assert client_config["components"] == []
+                executor = client_config["executors"][0]["executor"]
+                assert executor["path"].endswith(".ClientAPIExecutor")
+                executor_args = executor["args"]
+                assert executor_args["execution_mode"] == "external_process"
+                assert executor_args["command"][:3] == ["python3", "-u", f"custom/{os.path.basename(script_path)}"]
+                assert executor_args["launch_once"] is False
+                assert executor_args["shutdown_timeout"] == 25.0
+        finally:
+            # Clean up the temporary script file
+            if os.path.exists(script_path):
+                os.unlink(script_path)
+
+    @pytest.mark.parametrize(
+        "framework",
+        [
+            FrameworkType.PYTORCH,
+            FrameworkType.NUMPY,
+            FrameworkType.RAW,
+        ],
+    )
+    def test_launch_parameters_with_different_frameworks(self, mock_file_system, framework):
+        """Test that launch parameters work correctly with different frameworks."""
+        runner = ScriptRunner(
+            script="train.py",
+            launch_external_process=True,
+            launch_once=False,
+            shutdown_timeout=30.0,
+            framework=framework,
+        )
+
+        assert runner._launch_once is False
+        assert runner._shutdown_timeout == 30.0
+        assert runner._framework == framework
+
+
+class TestScriptRunnerMemoryManagement:
+    """Test cases for ScriptRunner memory management parameters."""
+
+    @pytest.fixture
+    def base_script_runner_params(self):
+        """Base parameters for creating ScriptRunner instances."""
+        return {
+            "script": "train.py",
+            "script_args": "--epochs 10",
+            "framework": FrameworkType.PYTORCH,
+        }
+
+    def test_default_memory_parameters(self, base_script_runner_params):
+        """Test that memory management parameters default to disabled."""
+        runner = ScriptRunner(**base_script_runner_params)
+
+        assert runner._memory_gc_rounds == 0
+        assert runner._cuda_empty_cache is False
+
+    @pytest.mark.parametrize(
+        "memory_gc_rounds,cuda_empty_cache",
+        [
+            (0, False),  # Disabled
+            (1, True),  # Every round with cuda cache
+            (5, False),  # Every 5 rounds without cuda cache
+            (10, True),  # Every 10 rounds with cuda cache
+        ],
+    )
+    def test_memory_parameter_configurations(self, base_script_runner_params, memory_gc_rounds, cuda_empty_cache):
+        """Test various memory management configurations."""
+        runner = ScriptRunner(
+            memory_gc_rounds=memory_gc_rounds,
+            cuda_empty_cache=cuda_empty_cache,
+            **base_script_runner_params,
+        )
+
+        assert runner._memory_gc_rounds == memory_gc_rounds
+        assert runner._cuda_empty_cache == cuda_empty_cache
+
+    def test_memory_parameters_with_external_process(self, base_script_runner_params):
+        """Test memory parameters with external process mode."""
+        runner = ScriptRunner(
+            launch_external_process=True,
+            memory_gc_rounds=3,
+            cuda_empty_cache=True,
+            **base_script_runner_params,
+        )
+
+        assert runner._memory_gc_rounds == 3
+        assert runner._cuda_empty_cache is True
+        assert runner._launch_external_process is True
+
+    def test_memory_parameters_with_in_process(self, base_script_runner_params):
+        """Test memory parameters with in-process mode."""
+        runner = ScriptRunner(
+            launch_external_process=False,
+            memory_gc_rounds=2,
+            cuda_empty_cache=True,
+            **base_script_runner_params,
+        )
+
+        assert runner._memory_gc_rounds == 2
+        assert runner._cuda_empty_cache is True
+        assert runner._launch_external_process is False
+
+    @pytest.mark.parametrize(
+        "framework",
+        [
+            FrameworkType.PYTORCH,
+            FrameworkType.NUMPY,
+        ],
+    )
+    def test_memory_parameters_with_different_frameworks(self, framework):
+        """Test that memory parameters work with different frameworks."""
+        runner = ScriptRunner(
+            script="train.py",
+            memory_gc_rounds=1,
+            cuda_empty_cache=True,
+            framework=framework,
+        )
+
+        assert runner._memory_gc_rounds == 1
+        assert runner._cuda_empty_cache is True
+        assert runner._framework == framework
+
+
+class TestExecutionModeSelection:
+    def test_new_executor_path_rejects_unknown_framework(self):
+        with pytest.raises(ValueError, match="Framework unknown unsupported"):
+            ScriptRunner(script="train.py", execution_mode="in_process", framework="unknown")
+
+    """execution_mode selects the new ClientAPIExecutor (design: client_api_execution_modes.md)."""
+
+    def test_in_process_mode_constructs_without_framework_imports(self):
+        # The new path declares PYTORCH without constructing converter components or
+        # importing torch during job construction.
+        runner = ScriptRunner(script="train.py", execution_mode="in_process")
+        assert runner._execution_mode == "in_process"
+        assert runner._params_exchange_format == ExchangeFormat.PYTORCH
+
+    def test_invalid_mode_rejected(self):
+        with pytest.raises(ValueError, match="invalid execution_mode"):
+            ScriptRunner(script="train.py", execution_mode="bogus")
+
+    @pytest.mark.parametrize("mode", ["attach"])
+    def test_not_yet_available_modes_fail_at_build_time(self, mode):
+        # fail when the job is BUILT, not when the backend panics at START_RUN
+        with pytest.raises(ValueError, match="invalid execution_mode"):
+            ScriptRunner(script="train.py", execution_mode=mode)
+
+    def test_external_process_mode_available(self):
+        runner = ScriptRunner(script="train.py", execution_mode="external_process")
+        assert runner._execution_mode == "external_process"
+
+    @pytest.mark.parametrize("mode", ["in_process", "external_process"])
+    @pytest.mark.parametrize(
+        "framework,native_format",
+        [
+            (FrameworkType.PYTORCH, ExchangeFormat.PYTORCH),
+            (FrameworkType.TENSORFLOW, ExchangeFormat.KERAS_LAYER_WEIGHTS),
+            (FrameworkType.NUMPY, ExchangeFormat.NUMPY),
+            (FrameworkType.RAW, ExchangeFormat.RAW),
+        ],
+    )
+    def test_recipe_declares_trainer_and_server_formats_without_conversion_filters(
+        self, mode, framework, native_format
+    ):
+        from nvflare.job_config.api import FedJob
+
+        with patch("os.path.isfile", return_value=True), patch("os.path.exists", return_value=True):
+            job = FedJob(name="formats")
+            job.to(
+                ScriptRunner(script="c.py", execution_mode=mode, command="python -u", framework=framework),
+                "site-1",
+                tasks=["train"],
+            )
+        app = job._deploy_map["site-1"].app_config
+        executor = app.executors[0].executor
+        assert executor._params_exchange_format == native_format
+        assert executor._server_expected_format == ExchangeFormat.NUMPY
+        assert app.task_data_filters == []
+        assert app.task_result_filters == []
+
+    def test_add_to_fed_job_wires_external_process_executor_with_command(self):
+        from nvflare.app_common.executors.client_api_executor import ClientAPIExecutor
+        from nvflare.job_config.api import FedJob
+
+        with patch("os.path.isfile", return_value=True), patch("os.path.exists", return_value=True):
+            job = FedJob(name="smoke-ext")
+            runner = ScriptRunner(
+                script="client.py",
+                script_args="--update_type full",
+                execution_mode="external_process",
+                command="python3 -u",
+                params_transfer_type=TransferType.DIFF,
+            )
+            job.to(runner, "site-1", tasks=["train"])
+
+        executor = job._deploy_map["site-1"].app_config.executors[0].executor
+        assert isinstance(executor, ClientAPIExecutor)
+        assert executor._execution_mode == "external_process"
+        # external_process names the trainer by a command (not an in-CJ task_script_path)
+        assert executor._command == ["python3", "-u", "custom/client.py", "--update_type", "full"]
+        assert executor._task_script_path is None
+        assert executor._params_exchange_format == ExchangeFormat.PYTORCH
+        assert executor._server_expected_format == ExchangeFormat.NUMPY
+        assert executor._params_transfer_type == TransferType.DIFF
+        # Zero means do not wait for natural exit before process-group termination. It must
+        # not be rewritten to None, which asks the backend to use its 30-second fallback.
+        assert executor._shutdown_timeout == 0.0
+        assert executor._build_backend_context().shutdown_timeout == 0.0
+
+    def test_external_process_command_preserves_argv_boundaries(self):
+        from nvflare.job_config.api import FedJob
+
+        with patch("os.path.isfile", return_value=True), patch("os.path.exists", return_value=True):
+            job = FedJob(name="spaced-command")
+            runner = ScriptRunner(
+                script="train model.py",
+                script_args='--label "two words" --empty ""',
+                execution_mode="external_process",
+                command="python3 -u",
+            )
+            job.to(runner, "site-1", tasks=["train"])
+
+        executor = job._deploy_map["site-1"].app_config.executors[0].executor
+        assert executor._command == [
+            "python3",
+            "-u",
+            "custom/train model.py",
+            "--label",
+            "two words",
+            "--empty",
+            "",
+        ]
+
+    def test_external_process_command_fills_explicit_multinode_site_block(self):
+        from nvflare.job_config.api import FedJob
+
+        launcher_spec = {
+            "default": {"slurm": {"nodes": 4}},
+            SERVER_SITE_NAME: {"slurm": {"nodes": 2}},
+            "site-multi": {"slurm": {"nodes": 2, "gpus_per_node": 1}},
+            "site-single": {"slurm": {"nodes": 1, "gpus_per_node": 1}},
+        }
+        job = FedJob(name="multinode-command", meta_props={JobMetaKey.JOB_LAUNCHER_SPEC.value: launcher_spec})
+        runner = ScriptRunner(
+            script="client.py",
+            script_args=["--label", "two words"],
+            launch_external_process=True,
+            command=["python3", "-m", "nvflare.app_opt.pt.torchrun_node", "--nproc-per-node=1"],
+        )
+
+        with patch("os.path.isfile", return_value=True), patch("os.path.exists", return_value=True):
+            job.to_clients(runner)
+
+        assert launcher_spec["site-multi"]["slurm"]["additional_node_command"] == (
+            "python3 -m nvflare.app_opt.pt.torchrun_node --nproc-per-node=1 custom/client.py --label 'two words'"
+        )
+        assert "additional_node_command" not in launcher_spec["default"]["slurm"]
+        assert "additional_node_command" not in launcher_spec[SERVER_SITE_NAME]["slurm"]
+        assert "additional_node_command" not in launcher_spec["site-single"]["slurm"]
+
+    def test_external_process_command_fills_only_matching_site(self):
+        from nvflare.job_config.api import FedJob
+
+        launcher_spec = {
+            "site-1": {"slurm": {"nodes": 2}},
+            "site-2": {"slurm": {"nodes": 2}},
+        }
+        job = FedJob(name="site-command", meta_props={JobMetaKey.JOB_LAUNCHER_SPEC.value: launcher_spec})
+        runner = ScriptRunner(script="client.py", launch_external_process=True, command="python3 -u")
+
+        with patch("os.path.isfile", return_value=True), patch("os.path.exists", return_value=True):
+            job.to(runner, "site-1")
+
+        assert launcher_spec["site-1"]["slurm"]["additional_node_command"] == "python3 -u custom/client.py"
+        assert "additional_node_command" not in launcher_spec["site-2"]["slurm"]
+
+    @pytest.mark.parametrize("explicit_value", [None, "custom-worker --arg"])
+    def test_explicit_additional_node_command_wins(self, explicit_value):
+        from nvflare.job_config.api import FedJob
+
+        block = {"nodes": 2, "additional_node_command": explicit_value}
+        job = FedJob(
+            name="explicit-command",
+            meta_props={JobMetaKey.JOB_LAUNCHER_SPEC.value: {"site-1": {"slurm": block}}},
+        )
+        runner = ScriptRunner(script="client.py", launch_external_process=True, launch_once=False)
+
+        with patch("os.path.isfile", return_value=True), patch("os.path.exists", return_value=True):
+            job.to_clients(runner)
+
+        assert block["additional_node_command"] == explicit_value
+
+    @pytest.mark.parametrize(
+        "runner, message",
+        [
+            (
+                ScriptRunner(script="client.py", launch_external_process=True, launch_once=False),
+                "launch_once=True",
+            ),
+            (
+                ScriptRunner(
+                    script="client.py",
+                    launch_external_process=True,
+                    script_args=["--api-key", "${secret:API_TOKEN}"],
+                ),
+                "does not support secret references",
+            ),
+        ],
+    )
+    def test_generated_additional_node_command_rejects_unsupported_runner(self, runner, message):
+        from nvflare.job_config.api import FedJob
+
+        job = FedJob(
+            name="invalid-generated-command",
+            meta_props={
+                JobMetaKey.JOB_LAUNCHER_SPEC.value: {
+                    "site-1": {"slurm": {"nodes": 2}},
+                }
+            },
+        )
+
+        with (
+            patch("os.path.isfile", return_value=True),
+            patch("os.path.exists", return_value=True),
+            pytest.raises(ValueError, match=message),
+        ):
+            job.to_clients(runner)
+
+    def test_external_process_command_argv_is_serialized(self, tmp_path, monkeypatch):
+        from nvflare.app_common.workflows.scatter_and_gather import ScatterAndGather
+        from nvflare.job_config.api import FedJob
+
+        monkeypatch.chdir(tmp_path)
+        script = tmp_path / "train model.py"
+        script.write_text("# test trainer\n")
+        job = FedJob(name="spaced-command-export")
+        job.to_server(ScatterAndGather(min_clients=1, num_rounds=1, wait_time_after_min_received=0))
+        job.to_clients(
+            ScriptRunner(
+                script=script.name,
+                script_args='--label "two words"',
+                execution_mode="external_process",
+                command="python3 -u",
+            )
+        )
+
+        export_dir = tmp_path / "export"
+        job.export_job(str(export_dir))
+        config_path = export_dir / job.name / "app" / "config" / "config_fed_client.json"
+        config = json.loads(config_path.read_text())
+
+        assert config["executors"][0]["executor"]["args"]["command"] == [
+            "python3",
+            "-u",
+            "custom/train model.py",
+            "--label",
+            "two words",
+        ]
+
+    def test_external_process_pre_tokenized_argv_is_preserved_and_serialized(self, tmp_path, monkeypatch):
+        from nvflare.app_common.workflows.scatter_and_gather import ScatterAndGather
+        from nvflare.job_config.api import FedJob
+
+        monkeypatch.chdir(tmp_path)
+        script = tmp_path / "train.py"
+        script.write_text("# test trainer\n")
+        command = ["/opt/python env/bin/python3", "-u"]
+        script_args = ["--output-dir", "/mnt/training runs/site-1", "--api-key", "${secret:API_TOKEN}"]
+        expected = [*command, "custom/train.py", *script_args]
+
+        job = FedJob(name="argv-command-export")
+        job.to_server(ScatterAndGather(min_clients=1, num_rounds=1, wait_time_after_min_received=0))
+        job.to_clients(
+            ScriptRunner(
+                script=script.name,
+                script_args=script_args,
+                execution_mode="external_process",
+                command=command,
+                framework=FrameworkType.NUMPY,
+            )
+        )
+
+        # Building the command must not mutate caller-owned argv lists.
+        assert command == ["/opt/python env/bin/python3", "-u"]
+        assert script_args == ["--output-dir", "/mnt/training runs/site-1", "--api-key", "${secret:API_TOKEN}"]
+
+        export_dir = tmp_path / "export"
+        job.export_job(str(export_dir))
+        config_path = export_dir / job.name / "app" / "config" / "config_fed_client.json"
+        config = json.loads(config_path.read_text())
+
+        assert config["executors"][0]["executor"]["args"]["command"] == expected
+
+    @pytest.mark.parametrize("execution_mode", ["in_process", "external_process"])
+    def test_absolute_script_destination_survives_sys_path_change(self, tmp_path, monkeypatch, execution_mode):
+        from nvflare.app_common.workflows.scatter_and_gather import ScatterAndGather
+        from nvflare.job_config.api import FedJob
+
+        source_dir = tmp_path / "src"
+        source_dir.mkdir()
+        script = source_dir / "client.py"
+        script.write_text("# test trainer\n")
+        original_sys_path = list(sys.path)
+        monkeypatch.setattr(sys, "path", [str(tmp_path), *original_sys_path])
+
+        job = FedJob(name=f"stable-{execution_mode}")
+        job.to_server(ScatterAndGather(min_clients=1, num_rounds=1, wait_time_after_min_received=0))
+        job.to_clients(ScriptRunner(script=str(script), execution_mode=execution_mode))
+
+        # Export under a different import root. Configuration and packaging must
+        # continue using the single destination selected when the runner was added.
+        monkeypatch.setattr(sys, "path", [str(source_dir), *original_sys_path])
+        export_dir = tmp_path / "export"
+        job.export_job(str(export_dir))
+
+        job_dir = export_dir / job.name
+        config = json.loads((job_dir / "app" / "config" / "config_fed_client.json").read_text())
+        executor_args = config["executors"][0]["executor"]["args"]
+        if execution_mode == "external_process":
+            assert executor_args["command"][2] == "custom/src/client.py"
+        else:
+            assert executor_args["task_script_path"] == "src/client.py"
+        assert (job_dir / "app" / "custom" / "src" / "client.py").is_file()
+        assert not (job_dir / "app" / "custom" / "client.py").exists()
+
+    def test_missing_absolute_in_process_script_remains_a_production_client_path(self, tmp_path):
+        from nvflare.app_common.executors.client_api_executor import ClientAPIExecutor
+        from nvflare.app_common.workflows.scatter_and_gather import ScatterAndGather
+        from nvflare.job_config.api import FedJob
+
+        remote_script = "/preinstalled/scripts/remote_train.py"
+        job = FedJob(name="remote-script")
+        job.to_server(ScatterAndGather(min_clients=1, num_rounds=1, wait_time_after_min_received=0))
+        job.to_clients(ScriptRunner(script=remote_script, execution_mode="in_process"))
+
+        app_config = job._deploy_map["@ALL"].app_config
+        executor = app_config.executors[0].executor
+        assert isinstance(executor, ClientAPIExecutor)
+        assert executor._task_script_path == remote_script
+        assert app_config._ext_script_destinations == {}
+
+        export_dir = tmp_path / "export"
+        job.export_job(str(export_dir))
+        config = json.loads((export_dir / job.name / "app" / "config" / "config_fed_client.json").read_text())
+        assert config["executors"][0]["executor"]["args"]["task_script_path"] == remote_script
+        assert not list((export_dir / job.name / "app" / "custom").rglob("remote_train.py"))
+
+    def test_distinct_absolute_scripts_keep_unique_relative_destinations(self, tmp_path, monkeypatch):
+        from nvflare.app_common.workflows.scatter_and_gather import ScatterAndGather
+        from nvflare.job_config.api import FedJob
+
+        project_dir = tmp_path / "project"
+        site_1_dir = project_dir / "site-1"
+        site_2_dir = project_dir / "site-2"
+        site_1_dir.mkdir(parents=True)
+        site_2_dir.mkdir(parents=True)
+        site_1_script = site_1_dir / "client.py"
+        site_2_script = site_2_dir / "client.py"
+        site_1_script.write_text("SITE = 1\n")
+        site_2_script.write_text("SITE = 2\n")
+        monkeypatch.setattr(sys, "path", [str(project_dir)])
+
+        job = FedJob(name="unique-scripts")
+        job.to_server(ScatterAndGather(min_clients=1, num_rounds=1, wait_time_after_min_received=0))
+        job.to_clients(ScriptRunner(script=str(site_1_script), execution_mode="in_process"), tasks=["site-1-train"])
+        job.to_clients(ScriptRunner(script=str(site_2_script), execution_mode="in_process"), tasks=["site-2-train"])
+        export_dir = tmp_path / "export"
+        job.export_job(str(export_dir))
+
+        job_dir = export_dir / job.name
+        config = json.loads((job_dir / "app" / "config" / "config_fed_client.json").read_text())
+        task_paths = [entry["executor"]["args"]["task_script_path"] for entry in config["executors"]]
+        assert task_paths == ["site-1/client.py", "site-2/client.py"]
+        assert (job_dir / "app" / "custom" / "site-1" / "client.py").read_text() == "SITE = 1\n"
+        assert (job_dir / "app" / "custom" / "site-2" / "client.py").read_text() == "SITE = 2\n"
+
+    def test_same_absolute_script_is_copied_to_each_frozen_destination(self, tmp_path, monkeypatch):
+        from nvflare.app_common.workflows.scatter_and_gather import ScatterAndGather
+        from nvflare.job_config.api import FedJob
+
+        project_dir = tmp_path / "project"
+        source_dir = project_dir / "src"
+        source_dir.mkdir(parents=True)
+        script = source_dir / "client.py"
+        script.write_text("VALUE = 1\n")
+
+        job = FedJob(name="reused-script")
+        job.to_server(ScatterAndGather(min_clients=1, num_rounds=1, wait_time_after_min_received=0))
+        monkeypatch.setattr(sys, "path", [str(project_dir)])
+        job.to_clients(ScriptRunner(script=str(script), execution_mode="in_process"), tasks=["nested-train"])
+        monkeypatch.setattr(sys, "path", [str(source_dir)])
+        job.to_clients(ScriptRunner(script=str(script), execution_mode="in_process"), tasks=["flat-train"])
+
+        export_dir = tmp_path / "export"
+        job.export_job(str(export_dir))
+
+        job_dir = export_dir / job.name
+        config = json.loads((job_dir / "app" / "config" / "config_fed_client.json").read_text())
+        task_paths = [entry["executor"]["args"]["task_script_path"] for entry in config["executors"]]
+        assert task_paths == ["src/client.py", "client.py"]
+        assert (job_dir / "app" / "custom" / "src" / "client.py").read_text() == "VALUE = 1\n"
+        assert (job_dir / "app" / "custom" / "client.py").read_text() == "VALUE = 1\n"
+
+    def test_resource_classification_matches_directory_precedence(self):
+        from nvflare.job_config.api import FedJob
+
+        with (
+            patch("os.path.isdir", return_value=True),
+            patch("os.path.isfile", return_value=True),
+            patch("os.path.exists", return_value=True),
+        ):
+            job = FedJob(name="filesystem-abstraction")
+            job.to_clients(ScriptRunner(script="client.py", execution_mode="in_process"))
+
+        app_config = job._deploy_map["@ALL"].app_config
+        assert app_config.ext_scripts == []
+        assert app_config.ext_dirs == ["client.py"]
+        assert app_config._ext_script_destinations == {}
+
+    def test_launch_flag_conflicts_with_explicit_in_process_mode(self):
+        with pytest.raises(ValueError, match="launch_external_process=True requires"):
+            ScriptRunner(script="train.py", execution_mode="in_process", launch_external_process=True)
+
+    def test_default_uses_in_process_client_api_executor(self):
+        runner = ScriptRunner(script="train.py", script_args="--epochs 10", framework=FrameworkType.NUMPY)
+        assert runner._execution_mode == "in_process"
+
+    def test_launch_external_process_selects_external_backend(self):
+        runner = ScriptRunner(
+            script="train.py",
+            launch_external_process=True,
+            framework=FrameworkType.NUMPY,
+        )
+        assert runner._execution_mode == "external_process"
+
+    def test_add_to_fed_job_wires_client_api_executor(self):
+        from nvflare.app_common.executors.client_api_executor import ClientAPIExecutor
+        from nvflare.job_config.api import FedJob
+
+        with patch("os.path.isfile", return_value=True), patch("os.path.exists", return_value=True):
+            job = FedJob(name="smoke")
+            runner = ScriptRunner(
+                script="client.py", script_args="--update_type full", execution_mode="in_process", memory_gc_rounds=2
+            )
+            job.to(runner, "site-1", tasks=["train"])
+
+        app = job._deploy_map["site-1"]
+        executors = app.app_config.executors
+        assert len(executors) == 1
+        executor = executors[0].executor
+        assert isinstance(executor, ClientAPIExecutor)
+        # the exact args the simulator smoke test validated end-to-end
+        assert executor._execution_mode == "in_process"
+        assert executor._task_script_path == "client.py"
+        assert executor._task_script_args == "--update_type full"
+        assert executor._memory_gc_rounds == 2
+        # no legacy stack components (pipes/launcher/relay) were added
+        assert app.app_config.components == {}
+        # the script rides along as an app resource
+        assert "client.py" in app.app_config.ext_scripts
+
+    def test_in_process_gpu_simulator_exports_subdirectory_script_sibling(self, tmp_path, monkeypatch):
+        from nvflare.app_common.workflows.scatter_and_gather import ScatterAndGather
+        from nvflare.job_config.api import FedJob
+
+        source_dir = tmp_path / "src"
+        source_dir.mkdir()
+        script = os.path.join("src", "poc_executor.py")
+        (source_dir / "poc_executor.py").write_text("from net import Net\n")
+        (source_dir / "net.py").write_text("class Net:\n    pass\n")
+        monkeypatch.chdir(tmp_path)
+
+        job = FedJob(name="job_api_basic_gpu")
+        job.to_server(ScatterAndGather(min_clients=2, num_rounds=2, wait_time_after_min_received=0))
+        job.to_clients(ScriptRunner(script=script, framework=FrameworkType.PYTORCH))
+
+        process = Mock()
+        process.wait.return_value = 0
+
+        def start_simulator(command, **kwargs):
+            job_dir = next(arg for arg in command if arg.endswith(os.sep + job.name))
+            custom_dir = os.path.join(job_dir, "app", "custom")
+            assert os.path.isfile(os.path.join(custom_dir, script))
+            assert os.path.isfile(os.path.join(custom_dir, "net.py"))
+            assert not os.path.exists(os.path.join(custom_dir, "src", "net.py"))
+
+            config_path = os.path.join(job_dir, "app", "config", "config_fed_client.json")
+            with open(config_path) as config_file:
+                executor_args = json.load(config_file)["executors"][0]["executor"]["args"]
+            assert executor_args["execution_mode"] == "in_process"
+            assert executor_args["task_script_path"] == script
+            assert command[command.index("-gpu") + 1] == "0,1"
+            return process
+
+        with patch("nvflare.job_config.fed_job_config.subprocess.Popen", side_effect=start_simulator):
+            result = job.simulator_run(str(tmp_path / "workspace"), n_clients=2, gpu="0,1")
+
+        assert result == 0

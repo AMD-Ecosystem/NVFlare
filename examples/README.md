@@ -1,0 +1,192 @@
+# NVIDIA FLARE Examples
+
+[NVIDIA FLARE](https://nvflare.readthedocs.io/en/main/index.html) provides several examples to help you get started using federated learning for your own applications.
+
+The provided examples cover different aspects of [NVIDIA FLARE](https://nvflare.readthedocs.io/en/main/index.html),
+such as using the provided [Controllers](https://nvflare.readthedocs.io/en/main/programming_guide/workflows_and_controllers.html)
+for "scatter and gather" or "cyclic weight transfer" workflows
+and different [Executors](https://nvflare.readthedocs.io/en/main/apidocs/nvflare.apis.executor.html)
+to implement your own training and validation pipelines.
+Some examples use the provided "task data" and "task result" [Filters](https://nvflare.readthedocs.io/en/main/apidocs/nvflare.apis.html?#module-nvflare.apis.filter) for homomorphic encryption and decryption or differential privacy.
+Furthermore, we show how to use different components for FL algorithms such as [FedAvg](https://arxiv.org/abs/1602.05629), [FedProx](https://arxiv.org/abs/1812.06127), and [FedOpt](https://arxiv.org/abs/2003.00295).
+We also provide domain-specific examples for deep learning and medical image analysis.
+
+## Getting started
+To get started with NVIDIA FLARE, please follow the [Getting Started Guide](https://nvflare.readthedocs.io/en/main/getting_started.html) in the documentation.
+This walks you through installation, creating a POC workspace, and deploying your first NVIDIA FLARE Application.
+The following examples will detail any additional requirements in their `requirements.txt`.
+
+## Set up a virtual environment
+We recommend setting up a virtual environment before installing the dependencies of the examples.
+**You need to set up the virtual environment and install nvflare and set additional `PYTHONPATH` before launch the jupyter lab.**
+
+Install dependencies for a virtual environment with:
+
+```shell
+python3 -m pip install --user --upgrade pip
+python3 -m pip install --user virtualenv
+```
+
+(If needed) make all shell scripts executable using:
+```shell
+find . -name ".sh" -exec chmod +x {} \;
+```
+
+Create and activate your virtual environment with the `set_env.sh` script:
+```shell
+source ./set_env.sh
+```
+
+Install nvflare
+```shell
+(nvflare_example)$ pip install nvflare
+```
+
+In each example folder, install required packages for training:
+```shell
+(nvflare_example)$ pip install --upgrade pip
+(nvflare_example)$ pip install -r requirements.txt
+```
+
+(optional) some examples contains script for plotting the TensorBoard event files, if needed, please also install:
+```shell
+(nvflare_example)$ pip install -r plot-requirements.txt
+```
+
+## Set up JupyterLab for notebooks
+To run examples including notebooks, we recommend using [JupyterLab](https://jupyterlab.readthedocs.io).
+**You need to set up the virtual environment and install nvflare and set additional `PYTHONPATH` before launch the jupyter lab.**
+
+After activating your virtual environment, install JupyterLab.
+```shell
+(nvflare_example)$ pip install jupyterlab
+```
+You can register the virtual environment you created, so it is usable in JupyterLab:
+```shell
+(nvflare_example)$ python3 -m ipykernel install --user --name="nvflare_example"
+```
+Start a Jupyter Lab:
+```shell
+(nvflare_example)$ jupyter lab .
+```
+When you open a notebook, select the kernel `nvflare_example` using the dropdown menu at the top right.
+![Selecting a JupyterLab kernel](./jupyterlab_kernel.png)
+
+## 1. Hello World Examples
+| Example                                                                      | Framework    | Summary                                                                                                                                                         |
+|------------------------------------------------------------------------------|--------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| [Notebook for Hello Examples](./hello-world/hello_world.ipynb)               | -            | Notebook for examples below.                                                                                                                                    |
+| [Hello NumPy](./hello-world/hello-numpy/README.md)             | Numpy        | Example using [FedAvg](https://nvflare.readthedocs.io/en/main/apidocs/nvflare.app_common.workflows.fedavg.html) with Recipe API.      |
+| [Hello FedAvg Collab](./hello-world/hello-collab/README.md)   | PyTorch      | Implements a custom FedAvg workflow with the Collab API and ordinary Python function calls.                                                                       |
+| [Hello Cross-Site Validation](./hello-world/hello-numpy-cross-val/README.md) | Numpy        | Example using [CrossSiteEval](https://nvflare.readthedocs.io/en/main/apidocs/nvflare.app_common.workflows.cross_site_eval.html) controller workflow, and example using previous results without training workflow. |
+| [Hello Cyclic Weight Transfer](./hello-world/hello-cyclic/README.md)         | PyTorch      | Example using [CyclicController](https://nvflare.readthedocs.io/en/main/apidocs/nvflare.app_common.workflows.cyclic_ctl.html) controller workflow to implement [Cyclic Weight Transfer](https://pubmed.ncbi.nlm.nih.gov/29617797/). |
+| [Hello JAX](./hello-world/hello-jax/README.md)                                | JAX          | Example using an MNIST classifier with [FedAvg](https://arxiv.org/abs/1602.05629) and JAX/Flax as the deep learning training framework. |
+| [Hello PyTorch](./hello-world/hello-pt/README.md)                            | PyTorch      | Example using an image classifier using [FedAvg](https://arxiv.org/abs/1602.05629) and [PyTorch](https://pytorch.org/) as the deep learning training framework. |
+| [Hello TensorFlow](./hello-world/hello-tf/README.md)                         | TensorFlow  | Example of using an image classifier using [FedAvg](https://arxiv.org/abs/1602.05629) and [TensorFlow](https://tensorflow.org/) as the deep learning training framework. |
+
+## 2. Tutorial notebooks
+| Example                                                                                                                                | Summary                                                                                                                                                         |
+|----------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| [Intro to the FL Simulator](./tutorials/flare_simulator.ipynb)                                                                         | Shows how to use the FLARE Simulator to run a local simulation.                                                                                                 |
+| [Hello FLARE API](./tutorials/flare_api.ipynb)                                                                                         | Goes through the different commands of the FLARE API.                                                                                                           |
+| [NVFLARE in POC Mode](./tutorials/setup_poc.ipynb)                                                                                     | Shows how to use POC mode.                                                                                                                                |
+| [NVFlare CLI](./tutorials/nvflare_cli.ipynb)                                                                                           | Walks through the current `nvflare` command groups for local setup, recipes, jobs, systems, studies, provisioning, and deployment.                     |
+| [Job Recipe](./tutorials/job_recipe.ipynb)                                                                                              | Introduces Job Recipes to simplify federated learning job creation and execution with a high-level API.                                                 |
+| [Logging Tutorial](./tutorials/logging.ipynb)                                                                                 | Shows how to use the logging configuration for different modules.                                                                                           |
+
+
+## 3. FL algorithms
+| Example                                                                                        | Summary                                                                                                                                                                                                                                                                   |
+|------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| [Simulated Federated Learning with CIFAR-10](./advanced/cifar10/pt/cifar10-sim/README.md)         | This example includes instructions on running [FedAvg](https://arxiv.org/abs/1602.05629), [FedProx](https://arxiv.org/abs/1812.06127), [FedOpt](https://arxiv.org/abs/2003.00295), and [SCAFFOLD](https://arxiv.org/abs/1910.06378) algorithms using NVFlare's FL simulator. |
+| [Real-world Federated Learning with CIFAR-10](./advanced/cifar10/pt/cifar10-real-world/README.md) | Includes instructions on running [FedAvg](https://arxiv.org/abs/1602.05629) with streaming of TensorBoard metrics to the server during training and [homomorphic encryption](https://developer.nvidia.com/blog/federated-learning-with-homomorphic-encryption/).          |
+| [Distributed Optimization](./advanced/distributed_optimization/README.md)                      | In this example we show how to exploit the lower-level NVFlare APIs to implement and run P2P distributed optimization algorithms. The aim here is twofold: on one hand we provide a few examples showing how to directly use the `nvflare.app_opt.p2p` API to run distributed optimization algorithms, on the other hand we provide a walkthrough of the actual implementation of the APIs in `nvflare.app_opt.p2p` to show how to exploit lower-level NVFlare APIs for advanced use-cases. |
+| [swarm learning](./advanced/swarm_learning/README.md)                                          | This example shows how to use swarm learning using PyTorch with the CIFAR-10 dataset. |
+| [Split learning](./advanced/vertical_federated_learning/cifar10-splitnn/README.md)        | Two-party CIFAR-10 SplitNN with Collab API and direct activation and gradient exchange. |
+
+## 4. Traditional ML examples
+| Example                                                                                    | Framework         | Notebooks or Readme                                                                                                   | Summary                                                                                                                                                                                                                                                                                                   |
+|--------------------------------------------------------------------------------------------|-------------------|-----------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| [Federated Linear Model with Scikit-learn](./advanced/sklearn-linear/README.md)            | scikit-learn      | [FL Model with Scikit-learn on HIGGS Dataset](./advanced/sklearn-linear/sklearn_linear_higgs.ipynb)                   | Shows how to use the NVIDIA FLARE with [scikit-learn](https://scikit-learn.org/), a widely used open-source machine learning library.                                                                                                                                                                     |
+| [Federated K-Means Clustering with Scikit-learn](./advanced/sklearn-kmeans/README.md)      | scikit-learn      | [Federated K-Means Clustering with Scikit-learn on Iris Dataset](./advanced/sklearn-kmeans/sklearn_kmeans_iris.ipynb) | NVIDIA FLARE with [scikit-learn](https://scikit-learn.org/) and k-Means.                                                                                                                                                                                                                                  |
+| [Federated SVM with Scikit-learn](./advanced/sklearn-svm/README.md)                        | scikit-learn      | [Federated SVM with Scikit-learn on Breast Cancer Dataset](./advanced/sklearn-svm/sklearn_svm_cancer.ipynb)           | NVIDIA FLARE with [scikit-learn](https://scikit-learn.org/) and [SVM](https://scikit-learn.org/stable/modules/generated/sklearn.svm.SVC.html).                                                                                                                                                            |
+| [Histogram-based and Tree-based FL for XGBoost](./advanced/xgboost/fedxgb/README.md)                | XGBoost           | [Histogram-based and Tree-based FL for XGBoost](./advanced/xgboost/fedxgb/README.md) | Histogram-based and Tree-based algorithm for XGBoost                                                              |
+| [Secure Histogram-based Federated Learning for XGBoost](./advanced/xgboost/fedxgb_secure/README.md) | XGBoost           | [Secure Histogram-based FL for XGBoost](./advanced/xgboost/fedxgb_secure/README.md)           | Secure Histogram-based algorithm for XGBoost, for both vertical and horizontal data splits                         |
+| [Federated Logistic Regression with Newton-Raphson](./hello-world/hello-lr/README.md)| scikit-learn      | [Federated Logistic Regression with Newton-Raphson](./hello-world/hello-lr/README.md)                         | This example shows how to implement a federated binary classification via logistic regression with second-order Newton-Raphson optimization.                                                                                                                                                              |
+| [Federated Survival Analysis with Kaplan-meier](./advanced/kaplan-meier-he/README.md)      | scikit-learn      | [Federated Survival Analysis with Kaplan-meier](./advanced/kaplan-meier-he/README.md)                                 | This example illustrates two features: 1) How to perform Kaplan-Meier survival analysis in federated setting without and with secure features via time-binning and Homomorphic Encryption (HE). 2) How to use the Flare ModelController API to contract a workflow to facilitate HE under simulator mode. |
+
+## 5. Medical Image Analysis
+| Example                                                                                                                                | Framework    | Summary                                                                                                                                                         |
+|----------------------------------------------------------------------------------------------------------------------------------------|--------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| [NVFlare + MONAI integration](../integration/monai/README.md)                                                                          | MONAI        | To use NVIDIA FLARE with MONAI Bundles, see the [migration guide](../integration/monai/MIGRATION.md) for the recommended Client API + Recipe pattern.          |
+| [Federated MedGemma Fine-Tuning](./advanced/medgemma/README.md)                                                                        | HuggingFace  | Federated QLoRA fine-tuning of MedGemma on histopathology images using the NCT-CRC-HE-100K dataset.                                                           |
+
+## 6. Federated Statistics
+[Federated Statistics Overview](./advanced/federated-statistics/README.md) discusses the overall federated statistics features.
+
+| Example                                                                                                                                |  Notebooks                                                                                                                                                             | Summary                                                                                                                                                         |
+|----------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| [Federated Statistics for Images](./advanced/federated-statistics/image_stats/README.md)                                               | [Image Histograms](advanced/federated-statistics/image_stats/image_stats.ipynb)                                                                                                  | Example of gathering local image histogram to compute the global dataset histograms.                                                                            |
+| [Federated Statistics for DataFrame](./advanced/federated-statistics/df_stats/README.md)                                               | [Data Frame Federated Statistics](./hello-world/hello-tabular-stats/df_stats.ipynb), [Visualization](./hello-world/hello-tabular-stats/demo/visualization.ipynb)  | Example of gathering local statistics summary from Pandas DataFrame to compute the global dataset statistics.                                                   |
+| [Federated Hierarchical Statistics for DataFrame](./advanced/federated-statistics/hierarchical_stats/README.md)                                               | [Federated Hierarchical Statistics](./advanced/federated-statistics/hierarchical_stats/hierarchical_stats.ipynb), [Visualization](./advanced/federated-statistics/hierarchical_stats/demo/visualization.ipynb)  | Example of generating federated hierarchical statistics for data that can be represented as Pandas DataFrame.                                                   |
+
+## 7. Federated Policies & Security
+| Example                                                                                                                                | Summary                                                                                                                                                         |
+|----------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| [Federated Policies](./advanced/federated-policies/README.rst)                                                                         | Discuss the federated site policies for authorization, resource and data privacy management. |
+| [Custom Authentication](./advanced/custom_authentication/README.rst)                                                                   | Demonstrate the custom authentication policy and secure mode. |
+| [Job-Level Authorization](./advanced/job-level-authorization/README.md)                                                                         | Demonstrate the job-level authorization policy and secure mode. |
+| [KeyCloak Site Authentication Integration](./advanced/keycloak-site-authentication/README.md)                                                     | Demonstrate KeyCloak integration for supporting site-specific authentication. |
+
+## 8. Experiment tracking
+| Example                                                                                                                                | Framework    | Summary                                                                                                                                                         |
+|----------------------------------------------------------------------------------------------------------------------------------------|--------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| [Hello PyTorch with TensorBoard Streaming](./advanced/experiment-tracking/tensorboard/README.md)                             | PyTorch      | Example building upon [Hello PyTorch](./hello-world/hello-pt/README.md) showcasing the [TensorBoard](https://tensorflow.org/tensorboard) streaming capability from the clients to the server.  |
+| [FL Experiment Tracking with MLflow](./advanced/experiment-tracking/mlflow/README.md)                             | PyTorch      | Example integrating [Hello PyTorch](./hello-world/hello-pt/README.md) with MLflow streaming capability from clients to the server.  |
+| [FL Experiment Tracking with Weights and Biases](./advanced/experiment-tracking/wandb/README.md)                             | PyTorch      | Example integrating [Hello PyTorch](./hello-world/hello-pt/README.md) with Weights and Biases streaming capability from clients to the server.  |
+
+## 9. NLP
+| Example                                                                               | Summary                                                                                                                                                         |
+|---------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| [NLP-NER](./tutorials/self-paced-training/part-4_advanced_federated_learning/chapter-8_federated_LLM_training/08.1_fed_bert/federated_nlp_with_bert.ipynb)                                               | Illustrates both [BERT](https://github.com/google-research/bert) and [GPT-2](https://github.com/openai/gpt-2) models from [Hugging Face](https://huggingface.co/) ([BERT-base-uncased](https://huggingface.co/bert-base-uncased), [GPT-2](https://huggingface.co/gpt2)) on a Named Entity Recognition (NER) task using the [NCBI disease dataset](https://pubmed.ncbi.nlm.nih.gov/24393765/).  |
+
+
+## 10. Federated Large Language Model (LLM)
+
+| Example                                                                             | Framework | Summary                                                                                                               |
+|-------------------------------------------------------------------------------------|-----------|-----------------------------------------------------------------------------------------------------------------------|
+| [Parameter Efficient Fine Turning](../integration/nemo/examples/peft)               | NeMo      | Example utilizing NeMo's PEFT methods to adapt a LLM to a downstream task. |
+| [Supervised Fine Tuning (SFT)](../integration/nemo/examples/supervised_fine_tuning) | NeMo      | Example to fine-tune all parameters of a LLM on supervised data. |
+| [LLM Tuning via HuggingFace SFT Trainer](./advanced/llm_hf)                         | NeMo      | Example for using FLARE with a HuggingFace trainer for LLM tuning tasks. |
+
+## 11. Graph Neural Network (GNN)
+
+| Example                               | Framework      | Summary                                                                                                                  |
+|---------------------------------------|----------------|--------------------------------------------------------------------------------------------------------------------------|
+| [Protein Classification](./advanced/gnn#federated-gnn-on-graph-dataset-using-inductive-learning) | PyTorch Geometric  | Example using GNNs for Protein Classification using [PPI](http://snap.stanford.edu/graphsage/#code) dataset using GraphSAGE. |
+| [Financial Transaction Classification](./advanced/gnn#federated-gnn-on-graph-dataset-using-inductive-learning) | PyTorch Geometric  | Example using GNNs for Financial Transaction Classification with [Elliptic++](https://github.com/git-disl/EllipticPlusPlus) dataset using GraphSAGE. |
+
+## 12. Financial Applications
+
+| Example                                                                                                        | Framework           | Summary                                                                                                                  |
+|----------------------------------------------------------------------------------------------------------------|---------------------|--------------------------------------------------------------------------------------------------------------------------|
+| [Financial Application with Federated XGBoost Methods](./advanced/finance)                                     | XGBoost             | Example using XGBoost in various ways to train a federated model to perform fraud detection with a finance dataset. |
+| [Financial Transaction Classification](./advanced/gnn#federated-gnn-on-graph-dataset-using-inductive-learning) | PyTorch Geometric   | Example using GNNs for Financial Transaction Classification with [Elliptic++](https://github.com/git-disl/EllipticPlusPlus) dataset using GraphSAGE. |
+| [Financial end-to-end](./advanced/finance-end-to-end/README.md)                                                | XGBoost & Geometric | This example demonstrates the use of an end-to-end process for credit card fraud detection using XGBoost. |
+
+
+## 13. FLARE EDGE
+
+| Example                                               | Framework | Summary                                                                                                                  |
+|-------------------------------------------------------|-----------|--------------------------------------------------------------------------------------------------------------------------|
+| [Flare Edge](./advanced/edge/README.md) | NA        | This example demonstrates FLARE mobile training jobs |
+
+## 14. Deployment, Monitoring & Misc.
+
+| Example                                                     | Framework | Summary                                                                                                                  |
+|-------------------------------------------------------------|-----------|--------------------------------------------------------------------------------------------------------------------------|
+| [Docker Job Launcher](./docker/README.md)                   | NA        | End-to-end Docker runtime example using `nvflare deploy prepare` and per-job Docker containers. |
+| [Recipe Job on Kubernetes Clients](./advanced/recipe-k8s/README.md) | PyTorch | Train CIFAR-10 through the Recipe API on two NVFlare clients in separate Kubernetes clusters with per-site resource and launcher metadata. |
+| [OpenShift Deployment](./devops/openshift/README.md)        | NA        | OpenShift-specific deployment guide and helper scripts using the Kubernetes runtime support. |
+| [DevOps Deployment Examples](./devops/README.md)            | NA        | Test-only helper scripts for trying NVFlare deployment flows on Kubernetes and managed cloud clusters; not production deployment guidance. |
+| [Monitoring](./advanced/monitoring/README.md)               | NA        | FLARE Monitoring provides an initial solution for tracking system metrics of your federated learning jobs. |

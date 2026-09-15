@@ -1,0 +1,92 @@
+# NVFlare advanced examples
+
+This folder contains advanced examples for NVFlare.
+
+Please make sure you set up a virtual environment and install JupyterLab following the [example root readme](../README.md).
+
+Please also install "./requirements.txt" in each example folder where it is
+provided.
+
+## Custom workflows
+* [Collab API](./collab/README.md)
+  * Advanced examples for custom server workflows, in-time aggregation, and decentralized client-to-client calls.
+
+## Client API
+* [Attach an externally managed trainer](./client-api-attach/README.md)
+  * Connects the same Client API training loop through either a direct network profile or shared-file rendezvous.
+
+## FL algorithms
+* [Federated Learning with CIFAR-10](./cifar10/README.md)
+  * [Simulated Federated Learning with CIFAR-10](./cifar10/pt/cifar10-sim/README.md)
+    * This example includes instructions on running [FedAvg](https://arxiv.org/abs/1602.05629), 
+  [FedProx](https://arxiv.org/abs/1812.06127), [FedOpt](https://arxiv.org/abs/2003.00295), 
+  and [SCAFFOLD](https://arxiv.org/abs/1910.06378) algorithms using NVFlare's FL simulator.
+  * [Real-world Federated Learning with CIFAR-10](./cifar10/pt/cifar10-real-world/README.md)
+    * Includes instructions on running [FedAvg](https://arxiv.org/abs/1602.05629) with streaming 
+  of TensorBoard metrics to the server during training 
+  and [homomorphic encryption](https://developer.nvidia.com/blog/federated-learning-with-homomorphic-encryption/).
+* [Federated XGBoost](./xgboost/README.md)
+  * Includes examples of [regular histogram-based and tree-based](./xgboost/fedxgb/README.md) algorithm, [secure histogram-based](./xgboost/fedxgb_secure/README.md).
+    Tree-based algorithms also include bagging and cyclic approaches.
+
+## Traditional ML examples
+* [Federated Linear Model with Scikit-learn](./sklearn-linear/README.md)
+  * Shows how to use the NVIDIA FLARE with [scikit-learn](https://scikit-learn.org/), a widely used open-source machine learning library.
+* [Federated K-Means Clustering with Scikit-learn](./sklearn-kmeans/README.md)
+  * NVIDIA FLARE with [scikit-learn](https://scikit-learn.org/) and k-Means.
+* [Federated SVM with Scikit-learn](./sklearn-svm/README.md)
+  * NVIDIA FLARE with [scikit-learn](https://scikit-learn.org/) and [SVM](https://scikit-learn.org/stable/modules/generated/sklearn.svm.SVC.html).
+* [Histogram-based and Tree-based FL for XGBoost](./xgboost/fedxgb/README.md)
+  * Example of using NVIDIA FLARE with [XGBoost](https://xgboost.readthedocs.io/) for histogram-based and bagging-style tree ensembles.
+
+## Medical Image Analysis
+* [NVFlare + MONAI Integration](./monai/README.md)
+  * Demonstrates federated learning with MONAI bundles using NVFlare's Client API and Job Recipe patterns.
+* [Federated MedGemma Fine-Tuning](./medgemma/README.md)
+  * Example of federated MedGemma QLoRA fine-tuning on histopathology image classification data with Hugging Face TRL.
+
+## Finance
+* [Financial Application with Federated XGBoost Methods](./finance/README.md)
+   * Illustrates the use of NVFlare on a financial application using XGBoost to train a model in a federated manner.
+
+## Swarm Learning
+* [Swarm Learning](./swarm_learning/README.md)
+   * Example of swarm learning with NVIDIA FLARE using PyTorch with the CIFAR-10 dataset.
+
+## Distributed Optimization / P2P algorithms
+* [Distributed Optimization](./distributed_optimization/README.md)
+   * Example of using the low-level NVFlare APIs to implement and run P2P distributed optimization algorithms.
+
+## Vertical Federated Learning
+* [Vertical Federated Learning](./vertical_federated_learning/README.md)
+   * Example of running split learning using the CIFAR-10 dataset.
+* [Vertical Federated XGBoost](./xgboost/README.md)
+   * Example of vertical federated learning with NVIDIA FLARE on tabular data.
+
+## Federated Statistics
+* [Federated Statistic Overview](./federated-statistics/README.md)
+  * Discuss the overall federated statistics features 
+* [Federated Statistics for Medical Imaging](./federated-statistics/image_stats/README.md)
+  * Example of gathering local image histogram to compute the global dataset histograms.
+* [Federated Statistics for DataFrame](./federated-statistics/df_stats/README.md)
+  * Example of gathering local statistics summary from Pandas DataFrame to compute the global dataset statistics.
+* [Federated Hierarchical Statistics](./federated-statistics/hierarchical_stats/README.md)
+  * Example of generating federated hierarchical statistics for data that can be represented as Pandas DataFrame.
+
+## Federated Policies
+* [Federated Policies](./federated-policies/README.rst) 
+  * Discuss the federated site policies for authorization, resource and data privacy management
+
+## Custom Authentication
+* [Custom Authentication](./custom_authentication/README.rst) 
+  * Example demonstrating custom authentication policy
+
+## Job-level Authorization
+* [Job-level Authorization](./job-level-authorization/README.md) 
+  * Example demonstrating job-level authorization policy
+
+## Experiment tracking
+* [Hello PyTorch with TensorBoard Streaming](./experiment-tracking/tensorboard/README.md)
+  * Example building upon [Hello PyTorch](../hello-world/hello-pt/README.md) showcasing the [TensorBoard](https://tensorflow.org/tensorboard) streaming capability from the clients to the server.
+* [Experiment Tracking with MLflow and Weights and Biases](./experiment-tracking/README.md)
+  * Example showing the use of the Writers and Receivers in NVFlare to write to different experiment tracking systems.

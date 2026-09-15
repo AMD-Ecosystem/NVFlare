@@ -1,0 +1,66 @@
+.. _nvflare_cli:
+
+###########################
+NVFlare CLI
+###########################
+
+``nvflare`` is the main command-line entry point for local development,
+provisioning, distributed provisioning, job submission, and runtime operations.
+
+Running ``nvflare -h`` shows the current command surface:
+
+.. code-block:: none
+
+   usage: nvflare [-h] [--version] [--format {txt,json}]
+                  [--connect-timeout CONNECT_TIMEOUT] ...
+
+Global options
+==============
+
+- ``--version`` / ``-V``: print the NVFlare version
+- ``--format {txt,json}``: select human-readable output or a JSON envelope
+- ``--connect-timeout``: control server connection timeout for remote commands
+
+Human-readable argument errors print command help first, then the specific
+message and hint. ``--format json`` prints only the JSON response or JSON
+error envelope, which is intended for automation and agent-style callers.
+
+Command groups
+==============
+
+- ``poc``: manage a local proof-of-concept deployment
+- ``provision``: centralized provisioning workflow
+- ``cert`` / ``package``: distributed (manual) provisioning workflow
+- ``deploy``: prepare existing server or client startup kits for deployment
+  runtimes such as Docker or Kubernetes
+- ``job``: submit and manage jobs
+- ``study``: manage multi-study lifecycle (register, enroll sites, manage users)
+- ``system``: inspect and operate a running FL system
+- ``config``: manage local CLI settings, including startup-kit registration
+  and active-kit selection
+- ``recipe``: list built-in recipe families for exported jobs
+- ``preflight-check``: validate a provisioned startup kit before deployment
+  (``preflight_check`` and ``preflight`` remain compatibility aliases)
+- ``dashboard``: start the Dashboard service
+
+Deprecated commands still exposed in help, such as ``simulator`` and
+``authz_preview``, are documented only briefly and should not be used for new
+workflows unless you are maintaining an older setup.
+
+.. toctree::
+   :maxdepth: 1
+
+   fl_simulator
+   poc_command
+   config_command
+   provision_command
+   distributed_provisioning
+   deploy_command
+   job_cli
+   study_command
+   system_command
+   cert_command
+   package_command
+   recipe_command
+   preflight_check
+   dashboard_command

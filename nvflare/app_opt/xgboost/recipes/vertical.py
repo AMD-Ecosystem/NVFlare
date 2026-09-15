@@ -1,0 +1,326 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from typing import Optional
+
+from pydantic import BaseModel, field_validator
+
+from nvflare.app_common.widgets.convert_to_fed_event import ConvertToFedEvent
+from nvflare.app_common.widgets.metrics_artifact_writer import MetricsArtifactWriter
+from nvflare.app_opt.tracking.tb.tb_receiver import TBAnalyticsReceiver
+from nvflare.app_opt.tracking.tb.tb_writer import TBWriter
+from nvflare.app_opt.xgboost.histogram_based_v2.fed_controller import XGBFedController
+from nvflare.app_opt.xgboost.histogram_based_v2.fed_executor import FedXGBHistogramExecutor
+from nvflare.job_config.api import FedJob
+from nvflare.recipe.spec import Recipe
+from nvflare.recipe.utils import _apply_legacy_constructor_config, _validate_per_site_targets
+
+
+# Internal — not part of the public API
+class _XGBVerticalValidator(BaseModel):
+    # Allow custom types in validation. Required by Pydantic v2.
+    model_config = {"arbitrary_types_allowed": True}
+
+    name: str
+    min_clients: int
+    num_rounds: int
+    label_owner: str
+    early_stopping_rounds: int
+    use_gpus: bool
+    secure: bool
+    client_ranks: dict
+    xgb_params: dict
+    data_loader_id: str
+    metrics_writer_id: str
+    in_process: bool
+    model_file_name: str
+
+    @field_validator("label_owner")
+    @classmethod
+    def check_label_owner(cls, v):
+        if not v.startswith("site-"):
+            raise ValueError("label_owner must be in format 'site-X' (e.g., 'site-1')")
+        return v
+
+    @field_validator("num_rounds")
+    @classmethod
+    def check_num_rounds(cls, v):
+        if v < 1:
+            raise ValueError("num_rounds must be at least 1")
+        return v
+
+
+class XGBVerticalRecipe(Recipe):
+    """XGBoost Vertical Federated Learning Recipe.
+
+    Recipe parameters, including ``xgb_params`` and nested ``per_site_config`` values,
+    must never contain actual secrets. Read secrets from site environment variables or mounted
+    files; references are supported only where documented in :mod:`nvflare.recipe.secrets`.
+
+    This recipe implements vertical federated XGBoost where different clients have different features
+    for the same samples. In vertical FL, data is split by columns (features) rather than rows (samples).
+
+    Key concepts:
+    - **Vertical split**: Each client has different features, same sample IDs
+    - **Label owner**: Only one client has the target labels
+    - **PSI required**: Private Set Intersection must be run first to align sample IDs
+    - **Histogram-based**: Uses histogram_v2 algorithm for vertical collaboration
+
+    Args:
+        name (str): Name of the federated job.
+        min_clients (int): The minimum number of clients for the job.
+        num_rounds (int): Number of boosting rounds.
+        label_owner (str): Client ID that owns the labels (e.g., 'site-1'). Must be in format 'site-X'.
+        early_stopping_rounds (int, optional): Early stopping rounds. Default is 3.
+        use_gpus (bool, optional): Whether to use GPUs for training. Default is False.
+        secure (bool, optional): Enable secure training with Homomorphic Encryption (HE). Default is False.
+            Requires encryption plugins to be installed and configured.
+        client_ranks (dict, optional): Mapping of client names to unique ranks (0-indexed).
+            Example: {"site-1": 0, "site-2": 1, "site-3": 2}.
+            In vertical mode, the label owner must be assigned rank 0. If client_ranks is omitted,
+            the recipe assigns the label owner rank 0 and assigns the remaining clients by name.
+            For secure training, provide client_ranks when a stable secure-rank mapping is required.
+        xgb_params (dict, optional): XGBoost parameters passed to xgboost.train(). If None, uses default params.
+            Default params: max_depth=8, eta=0.1, objective='binary:logistic', eval_metric='auc',
+            tree_method='hist', nthread=16.
+        data_loader_id (str, optional): ID of the data loader component. Default is 'dataloader'.
+        metrics_writer_id (str, optional): ID of the metrics writer component. Default is 'metrics_writer'.
+        in_process (bool, optional): Whether to run in-process (required for vertical). Default is True.
+        model_file_name (str, optional): Model file name. Default is 'test.model.json'.
+        per_site_config (dict, optional): Deprecated constructor form of per-site configuration.
+            New code should call ``set_per_site_config(recipe, config)`` immediately after construction.
+
+    Example:
+        .. code-block:: python
+
+            from nvflare.app_opt.xgboost.recipes import XGBVerticalRecipe
+            from vertical_data_loader import VerticalDataLoader
+            from nvflare.recipe import SimEnv, set_per_site_config
+
+            # Step 1: Run PSI first (separate job) to get intersection files
+            # ... PSI job execution ...
+
+            # Step 2: Create vertical XGBoost recipe and configure site data loaders
+            per_site_config = {
+                "site-1": {
+                    "data_loader": VerticalDataLoader(
+                        data_split_path="/tmp/data/site-1/higgs.data.csv",
+                        psi_path="/tmp/psi/site-1/intersection.txt",
+                        id_col="uid",
+                        label_owner="site-1",
+                        train_proportion=0.8,
+                    )
+                },
+                "site-2": {
+                    "data_loader": VerticalDataLoader(
+                        data_split_path="/tmp/data/site-2/higgs.data.csv",
+                        psi_path="/tmp/psi/site-2/intersection.txt",
+                        id_col="uid",
+                        label_owner="site-1",
+                        train_proportion=0.8,
+                    )
+                },
+            }
+            recipe = XGBVerticalRecipe(
+                name="xgb_vertical",
+                min_clients=2,
+                num_rounds=100,
+                label_owner="site-1",  # Only site-1 has labels
+            )
+            set_per_site_config(recipe, per_site_config)
+
+            # Step 3: Run with explicit client list
+            clients = list(per_site_config.keys())
+            env = SimEnv(clients=clients)
+            run = recipe.execute(env)
+
+    Note:
+        - **PSI must be run first** to compute sample intersection across clients
+        - Only one client should be designated as label_owner
+        - All clients must have overlapping sample IDs (after PSI)
+        - Uses histogram_v2 algorithm with data_split_mode=1 (vertical)
+        - Data loaders must be configured with ``set_per_site_config`` before export or execution
+        - Executor and metrics components are automatically added to each configured site
+        - TensorBoard tracking is automatically configured
+    """
+
+    _UNSUPPORTED_SECRET_REF_ATTRS = Recipe._UNSUPPORTED_SECRET_REF_ATTRS | {"per_site_config"}
+
+    def __init__(
+        self,
+        name: str,
+        min_clients: int,
+        num_rounds: int,
+        label_owner: str,
+        early_stopping_rounds: int = 3,
+        use_gpus: bool = False,
+        secure: bool = False,
+        client_ranks: Optional[dict] = None,
+        xgb_params: Optional[dict] = None,
+        data_loader_id: str = "dataloader",
+        metrics_writer_id: str = "metrics_writer",
+        in_process: bool = True,
+        model_file_name: str = "test.model.json",
+        per_site_config: Optional[dict[str, dict]] = None,
+    ):
+        # Set default XGBoost params if not provided
+        if xgb_params is None:
+            xgb_params = {
+                "max_depth": 8,
+                "eta": 0.1,
+                "objective": "binary:logistic",
+                "eval_metric": "auc",
+                "tree_method": "hist",
+                "nthread": 16,
+            }
+
+        # Validate inputs internally
+        v = _XGBVerticalValidator(
+            name=name,
+            min_clients=min_clients,
+            num_rounds=num_rounds,
+            label_owner=label_owner,
+            early_stopping_rounds=early_stopping_rounds,
+            use_gpus=use_gpus,
+            secure=secure,
+            client_ranks=client_ranks if client_ranks else {},
+            xgb_params=xgb_params,
+            data_loader_id=data_loader_id,
+            metrics_writer_id=metrics_writer_id,
+            in_process=in_process,
+            model_file_name=model_file_name,
+        )
+
+        self.name = v.name
+        self.min_clients = v.min_clients
+        self.num_rounds = v.num_rounds
+        self.label_owner = v.label_owner
+        self.early_stopping_rounds = v.early_stopping_rounds
+        self.use_gpus = v.use_gpus
+        self.secure = v.secure
+        self._requested_client_ranks = dict(v.client_ranks)
+        self.client_ranks = dict(v.client_ranks)
+        self.xgb_params = v.xgb_params
+        self.data_loader_id = v.data_loader_id
+        self.metrics_writer_id = v.metrics_writer_id
+        self.in_process = v.in_process
+        self.model_file_name = v.model_file_name
+        legacy_per_site_config = per_site_config
+        self.per_site_config = None
+
+        # Configure site-independent job components first. The controller and
+        # client apps depend on the site mapping and are prepared together later.
+        job = self.configure()
+        Recipe.__init__(self, job)
+
+        if legacy_per_site_config is not None:
+            _apply_legacy_constructor_config(self, legacy_per_site_config)
+
+    def configure(self):
+        """Configure the federated job for vertical XGBoost training."""
+
+        # Create FedJob
+        job = FedJob(name=self.name, min_clients=self.min_clients)
+        job.to_server(MetricsArtifactWriter(), id="metrics_artifact_writer")
+
+        # Add TensorBoard receiver to server
+        tb_receiver = TBAnalyticsReceiver(tb_folder="tb_events")
+        job.to_server(tb_receiver, id="tb_receiver")
+
+        return job
+
+    def _create_controller(self, client_ranks: dict) -> XGBFedController:
+        controller_kwargs = {
+            "num_rounds": self.num_rounds,
+            "data_split_mode": 1,  # 1 = vertical (column split)
+            "secure_training": self.secure,
+            "xgb_options": {"early_stopping_rounds": self.early_stopping_rounds, "use_gpus": self.use_gpus},
+            "xgb_params": self.xgb_params,
+            "client_ranks": client_ranks,
+        }
+
+        # In-process execution is required for secure training.
+        if self.secure:
+            controller_kwargs["in_process"] = True  # Required for secure training
+
+        return XGBFedController(**controller_kwargs)
+
+    def _resolve_client_ranks(self, config: dict[str, dict]) -> dict:
+        if self.label_owner not in config:
+            raise ValueError(f"label_owner {self.label_owner!r} must be included in per_site_config")
+
+        if not self._requested_client_ranks:
+            ranked_clients = [self.label_owner] + sorted(c for c in config if c != self.label_owner)
+            return {client_name: rank for rank, client_name in enumerate(ranked_clients)}
+
+        expected_clients = set(config)
+        ranked_clients = set(self._requested_client_ranks)
+        if ranked_clients != expected_clients:
+            raise ValueError(
+                f"client_ranks must include exactly the per_site_config clients: expected "
+                f"{sorted(expected_clients)}, got {sorted(ranked_clients)}"
+            )
+        non_integer_ranks = {
+            client_name: rank
+            for client_name, rank in self._requested_client_ranks.items()
+            if not isinstance(rank, int) or isinstance(rank, bool)
+        }
+        if non_integer_ranks:
+            raise ValueError(f"client_ranks values must be integers, got {non_integer_ranks}")
+        expected_ranks = set(range(len(config)))
+        actual_ranks = set(self._requested_client_ranks.values())
+        if actual_ranks != expected_ranks:
+            raise ValueError(
+                f"client_ranks values must be unique and consecutive from 0 to {len(config) - 1}: "
+                f"got {self._requested_client_ranks}"
+            )
+        if self._requested_client_ranks.get(self.label_owner) != 0:
+            raise ValueError("label_owner must be assigned rank 0 for vertical XGBoost")
+        return dict(self._requested_client_ranks)
+
+    def _add_client_components(self, job: FedJob, site_name: str, site_config: dict) -> None:
+        executor = FedXGBHistogramExecutor(
+            data_loader_id=self.data_loader_id,
+            metrics_writer_id=self.metrics_writer_id,
+            in_process=True if self.secure else self.in_process,
+            model_file_name=self.model_file_name,
+        )
+        job.to(executor, site_name, id="xgb_hist_executor", tasks=["config", "start"])
+        job.to(TBWriter(event_type="analytix_log_stats"), site_name, id=self.metrics_writer_id)
+        job.to(
+            ConvertToFedEvent(events_to_convert=["analytix_log_stats"], fed_event_prefix="fed."),
+            site_name,
+            id="event_to_fed",
+        )
+        job.to(site_config["data_loader"], site_name, id=self.data_loader_id)
+
+    def _apply_per_site_config(self, config: dict[str, dict]) -> None:
+        _validate_per_site_targets(config, self.min_clients)
+        for site_name, site_config in config.items():
+            if site_config.get("data_loader") is None:
+                raise ValueError(f"per_site_config for {site_name!r} must include 'data_loader' key")
+
+        client_ranks = self._resolve_client_ranks(config)
+        self.client_ranks = client_ranks
+        self.per_site_config = config
+
+    def _prepare_client_apps(self) -> None:
+        self._validate_before_use()
+        self._job.to_server(self._create_controller(self.client_ranks), id="xgb_controller")
+        for site_name, site_config in self.per_site_config.items():
+            self._add_client_components(self._job, site_name, site_config)
+
+    def _validate_before_use(self) -> None:
+        if not self.configured_sites():
+            raise RuntimeError("XGBVerticalRecipe requires set_per_site_config() before export or execution")

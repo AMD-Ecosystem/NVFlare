@@ -1,0 +1,96 @@
+.. _preflight_check:
+
+****************************************
+NVIDIA FLARE Preflight Check
+****************************************
+
+The NVIDIA FLARE preflight check is to help perform preliminary checks before users start an
+NVFlare subsystem on their machine to catch errors early and mitigate the pain of setting up and running jobs in
+NVIDIA FLARE.
+
+General Usage
+=============
+
+.. code-block::
+
+    nvflare preflight-check -p PACKAGE_PATH
+    nvflare preflight-check --package-path PACKAGE_PATH
+
+
+This preflight check script should be run on each site's machine. The ``PACKAGE_PATH`` is the path to the folder that contains
+the package to be checked.
+
+After running the script, for the checks that pass, users will see "PASSED". The problem and how
+to fix it is reported for checks that fail.
+
+Exit code ``0`` means all applicable checks passed. Exit code ``1`` means at least one applicable check failed.
+Exit code ``4`` means the package path or package format is invalid.
+
+Below are the scripts to run the preflight check on each type of site and the possible problems that may be reported.
+
+
+Preflight check on server site
+------------------------------
+
+If the server package is in "/path_to_NVFlare/NVFlare/workspace/example_project/prod_00" and it is called "server1",
+on the server site, a user should run: 
+
+.. code-block::
+
+  nvflare preflight-check -p /path_to_NVFlare/NVFlare/workspace/example_project/prod_00/server1
+
+The problems that may be reported:
+
+.. csv-table::
+    :header: Checks,Problems,How to fix
+    :widths: 15, 20, 25
+
+    Check FL port binding,Can't bind to address ({host}:{port}): {e},Please check the DNS and port.
+    Check admin port binding,Can't bind to address ({host}:{port}): {e},Please check the DNS and port.
+    Check snapshot storage writable,Can't write to {snapshot_storage_root}: {e}.,Please check the user permission.
+    Check job storage writable,Can't write to {job_storage_root}: {e}.,Please check the user permission.
+    Check dry run,Can't start successfully: {error},Please check the error message of dry run.
+
+
+Preflight check on client sites
+-------------------------------
+
+Before you check the clients, make sure the server is running.
+
+If the client package is in "/path_to_NVFlare/NVFlare/workspace/example_project/prod_00" and it is called "site-1"
+So on the client site, a user will run: 
+
+.. code-block::
+
+  nvflare preflight-check -p /path_to_NVFlare/NVFlare/workspace/example_project/prod_00/site-1
+
+The problems that may be reported:
+
+.. csv-table::
+    :header: Checks,Problems,How to fix
+    :widths: 15, 20, 25
+
+    Check server available,Can't connect to {scheme} server ({host}:{port}),Please check if server is up.
+    Check dry run,Can't start successfully: {error},Please check the error message of dry run.
+
+
+Preflight check for admin consoles 
+----------------------------------
+
+Before you check the FLARE Admin Console, make sure the server is running.
+
+If the FLARE Console package is in "/path_to_NVFlare/NVFlare/workspace/example_project/prod_00/" and it is called "admin@nvidia.com",
+a user should run:
+
+.. code-block::
+
+  nvflare preflight-check -p /path_to_NVFlare/NVFlare/workspace/example_project/prod_00/admin@nvidia.com
+
+The problems that may be reported:
+
+.. csv-table::
+    :header: Checks,Problems,How to fix
+    :widths: 15, 20, 25
+
+    Check server available,Can't connect to {scheme} server ({host}:{port}),Please check if server is up.
+    Check dry run,Can't start successfully: {error},Please check the error message of dry run.

@@ -1,0 +1,4 @@
+nvflare~=2.7rc
+scikit-learn>=1.0.0 
+seaborn
+tensorboard

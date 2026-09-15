@@ -1,0 +1,244 @@
+# Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+
+from cryptography.exceptions import InvalidKey, InvalidSignature
+from cryptography.hazmat.primitives import asymmetric, hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.x509 import Certificate
+
+from nvflare.lighter.utils import verify_cert_chain
+
+HASH_LENGTH = 4  # Adjustable to avoid collision
+# Versioned envelope: version | nonce | wrapped key | signature | AES-GCM ciphertext and tag.
+# The signature covers every field except itself so the claimed sender authenticates each message.
+CELL_CIPHER_VERSION = b"\x01"
+VERSION_LENGTH = len(CELL_CIPHER_VERSION)
+NONCE_LENGTH = 12  # AES-GCM recommends a 96-bit nonce
+KEY_LENGTH = 32  # AES 256.  Choose from 16, 24, 32
+KEY_ENC_LENGTH = 256
+SIGNATURE_LENGTH = 256
+TAG_LENGTH = 16
+SIMPLE_HEADER_LENGTH = VERSION_LENGTH + NONCE_LENGTH + KEY_ENC_LENGTH + SIGNATURE_LENGTH
+MIN_CIPHER_LENGTH = SIMPLE_HEADER_LENGTH + TAG_LENGTH
+
+
+def get_hash(value):
+    hash = hashes.Hash(hashes.SHA256())
+    hash.update(value)
+    return hash.finalize()
+
+
+class SessionKeyUnavailable(Exception):
+    pass
+
+
+class InvalidCertChain(Exception):
+    pass
+
+
+def _normalize_cert_chain(cert) -> list:
+    if isinstance(cert, Certificate):
+        return [cert]
+    return list(cert)
+
+
+def _asym_enc(k, m):
+    return k.encrypt(
+        m,
+        asymmetric.padding.OAEP(
+            mgf=asymmetric.padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None
+        ),
+    )
+
+
+def _asym_dec(k, m):
+    return k.decrypt(
+        m,
+        asymmetric.padding.OAEP(
+            mgf=asymmetric.padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None
+        ),
+    )
+
+
+def _sign(k, m):
+    return k.sign(
+        data=m,
+        padding=asymmetric.padding.PSS(
+            mgf=asymmetric.padding.MGF1(hashes.SHA256()),
+            salt_length=asymmetric.padding.PSS.MAX_LENGTH,
+        ),
+        algorithm=hashes.SHA256(),
+    )
+
+
+def _verify(k, m, s):
+
+    if not isinstance(m, bytes):
+        m = bytes(m)
+
+    if not isinstance(s, bytes):
+        s = bytes(s)
+
+    k.verify(
+        s,
+        m,
+        asymmetric.padding.PSS(
+            mgf=asymmetric.padding.MGF1(hashes.SHA256()), salt_length=asymmetric.padding.PSS.MAX_LENGTH
+        ),
+        hashes.SHA256(),
+    )
+
+
+def _sym_enc(k: bytes, n: bytes, m: bytes, associated_data: bytes):
+    return AESGCM(k).encrypt(n, m, associated_data)
+
+
+def _sym_dec(k: bytes, n: bytes, m: bytes, associated_data: bytes):
+    return AESGCM(k).decrypt(n, m, associated_data)
+
+
+class SessionKeyManager:
+    def __init__(self, root_ca):
+        self.key_hash_dict = dict()
+        self.root_ca = root_ca
+        self.root_ca_pub_key = root_ca.public_key()
+
+    def validate_cert_chain(self, cert):
+        self.root_ca_pub_key.verify(
+            cert.signature, cert.tbs_certificate_bytes, asymmetric.padding.PKCS1v15(), cert.signature_hash_algorithm
+        )
+
+    def key_request(self, remote_cert, local_cert, local_pri_key):
+        session_key = os.urandom(KEY_LENGTH)
+        signature = _sign(local_pri_key, session_key)
+        try:
+            self.validate_cert_chain(remote_cert)
+        except InvalidSignature:
+            return False
+
+        remote_pub_key = remote_cert.public_key()
+        key_enc = _asym_enc(remote_pub_key, session_key)
+        self.key_hash_dict[get_hash(session_key)[-HASH_LENGTH:]] = session_key
+        key_response = key_enc + signature
+        return key_response
+
+    def process_key_response(self, remote_cert, local_cert, local_pri_key, key_response):
+        key_enc, signature = key_response[:KEY_ENC_LENGTH], key_response[KEY_ENC_LENGTH:]
+        try:
+            session_key = _asym_dec(local_pri_key, key_enc)
+            self.validate_cert_chain(remote_cert)
+            public_key = remote_cert.public_key()
+            _verify(public_key, session_key, signature)
+            self.key_hash_dict[get_hash(session_key)[-HASH_LENGTH:]] = session_key
+        except (InvalidKey, InvalidSignature, InvalidCertChain):
+            return False
+        return True
+
+    def key_available(self):
+        return bool(self.key_hash_dict)
+
+    def get_key(self, key_hash):
+        return self.key_hash_dict.get(key_hash)
+
+    def get_latest_key(self):
+        try:
+            k, last_value = _, self.key_hash_dict[k] = self.key_hash_dict.popitem()
+        except KeyError:
+            raise SessionKeyUnavailable("No session key established yet")
+        return last_value
+
+
+class SimpleCellCipher:
+    def __init__(self, root_ca: Certificate, pri_key: asymmetric.rsa.RSAPrivateKey, cert):
+        self._root_ca = root_ca
+        self._root_ca_pub_key = root_ca.public_key()
+        self._pri_key = pri_key
+        self._cert_chain = _normalize_cert_chain(cert)
+        self._cert = self._cert_chain[0]
+        self._pub_key = self._cert.public_key()
+        self._validate_cert_chain(self._cert_chain)
+        self._cached_enc = dict()
+        self._cached_dec = dict()
+
+    def _validate_cert_chain(self, cert) -> Certificate:
+        cert_chain = _normalize_cert_chain(cert)
+        try:
+            verify_cert_chain(
+                leaf_cert=cert_chain[0],
+                intermediate_certs=cert_chain[1:],
+                root_ca_cert=self._root_ca,
+            )
+        except Exception as ex:
+            raise InvalidCertChain(str(ex)) from ex
+
+        return cert_chain[0]
+
+    def encrypt(self, message: bytes, target_cert):
+        target_cert_chain = _normalize_cert_chain(target_cert)
+        if not target_cert_chain:
+            raise InvalidCertChain("cert chain must contain at least one certificate")
+        target_cert = target_cert_chain[0]
+        cert_hash = target_cert.fingerprint(hashes.SHA256())
+        secret = self._cached_enc.get(cert_hash)
+        if secret is None:
+            target_cert = self._validate_cert_chain(target_cert_chain)
+            key = os.urandom(KEY_LENGTH)
+            remote_pub_key = target_cert.public_key()
+            key_enc = _asym_enc(remote_pub_key, key)
+            self._cached_enc[cert_hash] = (key, key_enc)
+        else:
+            (key, key_enc) = secret
+        nonce = os.urandom(NONCE_LENGTH)
+        associated_data = CELL_CIPHER_VERSION + key_enc
+        encrypted = _sym_enc(key, nonce, message, associated_data)
+        signature = _sign(self._pri_key, CELL_CIPHER_VERSION + nonce + key_enc + encrypted)
+        return CELL_CIPHER_VERSION + nonce + key_enc + signature + encrypted
+
+    def decrypt(self, message: bytes, origin_cert):
+        if not isinstance(message, bytes):
+            message = bytes(message)
+        if len(message) < MIN_CIPHER_LENGTH:
+            raise ValueError(f"ciphertext is too short: {len(message)} < {MIN_CIPHER_LENGTH}")
+
+        version = message[:VERSION_LENGTH]
+        if version != CELL_CIPHER_VERSION:
+            raise ValueError(f"unsupported cell cipher version: {version!r}")
+
+        nonce_start = VERSION_LENGTH
+        key_start = nonce_start + NONCE_LENGTH
+        signature_start = key_start + KEY_ENC_LENGTH
+        nonce, key_enc, signature = (
+            message[nonce_start:key_start],
+            message[key_start:signature_start],
+            message[signature_start:SIMPLE_HEADER_LENGTH],
+        )
+        encrypted = message[SIMPLE_HEADER_LENGTH:]
+        origin_cert_chain = _normalize_cert_chain(origin_cert)
+        if not origin_cert_chain:
+            raise InvalidCertChain("cert chain must contain at least one certificate")
+        cert_hash = origin_cert_chain[0].fingerprint(hashes.SHA256())
+        cache_key = (cert_hash, key_enc)
+        dec = self._cached_dec.get(cache_key)
+        if dec is None:
+            origin_cert = self._validate_cert_chain(origin_cert_chain)
+            public_key = origin_cert.public_key()
+            _verify(public_key, version + nonce + key_enc + encrypted, signature)
+            key = _asym_dec(self._pri_key, key_enc)
+            self._cached_dec[cache_key] = (key, public_key)
+        else:
+            key, public_key = dec
+            _verify(public_key, version + nonce + key_enc + encrypted, signature)
+        return _sym_dec(key, nonce, encrypted, version + key_enc)

@@ -1,0 +1,1166 @@
+.. _available_recipes:
+
+##################
+Available Recipes
+##################
+
+NVFlare provides a variety of pre-built recipes for common federated learning algorithms and workflows.
+Recipes are high-level, declarative APIs that simplify job configuration and execution.
+
+.. contents:: Table of Contents
+   :local:
+   :depth: 2
+
+Before You Start
+================
+
+This page is a catalog of available recipe classes and short starting snippets.
+For model input formats, checkpoint behavior, and execution environments, see
+:ref:`job_recipe`. For common Recipe methods, helpers, and stable API behavior,
+see :ref:`recipe_api`.
+
+.. important::
+
+   Recipe arguments and helper configuration become part of the generated job
+   definition. Never put an actual password, token, API key, private key, or
+   other credential in any recipe parameter, including nested dictionaries.
+   Keep secrets in site environment variables or mounted secret files. Use
+   ``secret_ref`` or ``secret_file_ref`` only at supported runtime boundaries;
+   otherwise read the secret directly inside your training code. See
+   :ref:`recipe_secrets` for the supported locations.
+
+Fed Task
+==============
+
+For one-round workflows that do not have a global model lifecycle, use ``FedTaskRecipe``.
+This is useful for client-side embedding extraction, preprocessing, feature generation, local evaluation,
+or other federated tasks that only need the server to coordinate one script execution across clients.
+
+.. code-block:: python
+
+    from nvflare.recipe import FedTaskRecipe, SimEnv
+
+    recipe = FedTaskRecipe(
+        name="extract-embeddings",
+        task_name="embed",
+        min_clients=2,
+        task_script="client.py",
+        task_args="--data-root /data --output-root /tmp/embeddings",
+    )
+    env = SimEnv(num_clients=2)
+    run = recipe.execute(env)
+
+``FedTaskRecipe`` sends one ``FLModel`` task to the selected clients and waits for their results.
+It does not require ``model``, ``initial_ckpt``, or ``model_persistor``.
+
+Federated Averaging (FedAvg)
+============================
+
+The most fundamental federated learning algorithm that aggregates model updates from multiple clients
+by computing a weighted average.
+
+PyTorch FedAvg
+--------------
+
+.. code-block:: python
+
+    from nvflare.app_opt.pt.recipes import FedAvgRecipe
+    from nvflare.recipe import SimEnv
+
+    recipe = FedAvgRecipe(
+        name="fedavg-pt",
+        min_clients=2,
+        num_rounds=5,
+        model=MyModel(),
+        train_script="client.py",
+    )
+    env = SimEnv(num_clients=2)
+    run = recipe.execute(env)
+
+For large PyTorch model updates, ``FedAvgRecipe`` also supports
+``enable_tensor_disk_offload=True`` to reduce server memory use by materializing
+incoming streamed tensors to temporary files. See
+:ref:`Starting Federated Learning Servers <starting_fl_servers>` for deployment
+notes about configuring the server temporary directory.
+
+**Examples:**
+
+- `examples/hello-world/hello-pt <https://github.com/NVIDIA/NVFlare/tree/main/examples/hello-world/hello-pt>`_
+- `examples/advanced/cifar10/pt/cifar10-sim/cifar10_fedavg <https://github.com/NVIDIA/NVFlare/tree/main/examples/advanced/cifar10/pt/cifar10-sim/cifar10_fedavg>`_
+
+TensorFlow FedAvg
+-----------------
+
+.. code-block:: python
+
+    from nvflare.app_opt.tf.recipes import FedAvgRecipe
+    from nvflare.recipe import SimEnv
+
+    recipe = FedAvgRecipe(
+        name="fedavg-tf",
+        min_clients=2,
+        num_rounds=5,
+        model=MyTFModel(),
+        train_script="client.py",
+    )
+    env = SimEnv(num_clients=2)
+    run = recipe.execute(env)
+
+**Examples:**
+
+- `examples/hello-world/hello-tf <https://github.com/NVIDIA/NVFlare/tree/main/examples/hello-world/hello-tf>`_
+- `examples/advanced/cifar10/tf/cifar10_fedavg <https://github.com/NVIDIA/NVFlare/tree/main/examples/advanced/cifar10/tf/cifar10_fedavg>`_
+
+NumPy FedAvg
+------------
+
+For framework-agnostic or NumPy-based models.
+
+.. code-block:: python
+
+    from nvflare.app_common.np.recipes import NumpyFedAvgRecipe
+    from nvflare.recipe import SimEnv
+
+    recipe = NumpyFedAvgRecipe(
+        name="fedavg-numpy",
+        min_clients=2,
+        num_rounds=5,
+        model=[0.0, 0.0, 0.0],
+        train_script="client.py",
+    )
+    env = SimEnv(num_clients=2)
+    run = recipe.execute(env)
+
+**Examples:**
+
+- `examples/hello-world/hello-numpy <https://github.com/NVIDIA/NVFlare/tree/main/examples/hello-world/hello-numpy>`_
+
+Sklearn FedAvg
+--------------
+
+For scikit-learn based models.
+
+.. code-block:: python
+
+    from nvflare.app_opt.sklearn.recipes import SklearnFedAvgRecipe
+    from nvflare.recipe import SimEnv
+
+    recipe = SklearnFedAvgRecipe(
+        name="fedavg-sklearn",
+        min_clients=2,
+        num_rounds=5,
+        train_script="client.py",
+    )
+    env = SimEnv(num_clients=2)
+    run = recipe.execute(env)
+
+**Examples:**
+
+- `examples/advanced/sklearn-linear <https://github.com/NVIDIA/NVFlare/tree/main/examples/advanced/sklearn-linear>`_
+
+FedAvg with Homomorphic Encryption
+----------------------------------
+
+FedAvg with secure aggregation using homomorphic encryption.
+
+.. code-block:: python
+
+    from nvflare.app_opt.pt.recipes import FedAvgRecipeWithHE
+    from nvflare.recipe import ProdEnv
+
+    recipe = FedAvgRecipeWithHE(
+        name="fedavg-he",
+        min_clients=2,
+        num_rounds=5,
+        model=MyModel(),
+        train_script="client.py",
+    )
+    env = ProdEnv(
+        startup_kit_location="/path/to/startup_kit/admin@nvidia.com",
+        username="admin@nvidia.com",
+    )
+    run = recipe.execute(env)
+
+.. note::
+   ``FedAvgRecipeWithHE`` requires provisioned startup kits with homomorphic encryption context files.
+   Use ``ProdEnv`` or ``PocEnv`` with HE provisioning; ``SimEnv`` is not supported.
+
+**Examples:**
+
+- `examples/advanced/cifar10/pt/cifar10-real-world#secure-aggregation-using-homomorphic-encryption <https://github.com/NVIDIA/NVFlare/tree/main/examples/advanced/cifar10/pt/cifar10-real-world#42-secure-aggregation-using-homomorphic-encryption>`_
+
+FedCE
+=====
+
+``FedCERecipe`` implements contribution-aware aggregation for PyTorch. It estimates each client's
+contribution from gradient-direction novelty and a client-computed leave-one-out (minus-model) score,
+then uses those estimates as aggregation weights.
+
+FedCE requires at least two clients and assumes full participation in every round. Configure
+``min_clients`` to include all participating clients whenever possible. If the client set changes,
+NVFlare logs a warning, initializes unseen clients with a uniform prior, and carries the most recent
+contribution weights of absent clients forward.
+
+.. code-block:: python
+
+    from nvflare.app_opt.pt.recipes import FedCERecipe
+
+    recipe = FedCERecipe(
+        name="fedce-pt",
+        model=MyModel(),
+        min_clients=3,
+        num_rounds=10,
+        train_script="client.py",
+        fedce_mode="plus",
+    )
+
+FedCE requires a compatible client training script. The script must return model differences and set
+``FLModel.meta["fedce_minus_val"]``. The ``PTFedCEHelper`` utility constructs the minus model,
+reads the prior contribution weight from the received model metadata, and attaches the score to the result.
+The score must increase with estimated contribution, regardless of the validation metric's direction.
+For a higher-is-better metric such as Dice, use ``1 - minus_model_dice`` so a larger performance drop
+produces a larger score, matching the research implementation. For a lower-is-better metric such as loss,
+use ``minus_model_loss`` because a larger loss after removing the client already indicates greater contribution.
+When ``model`` is supplied as a dict config, pass ``trainable_param_names`` explicitly so contribution
+estimation excludes non-trainable state such as BatchNorm running statistics and counters.
+FedCE is therefore a dedicated algorithm recipe, not a passive option on ``FedAvgRecipe``.
+
+**Example:**
+
+- `research/fed-ce <https://github.com/NVIDIA/NVFlare/tree/main/research/fed-ce>`_
+
+WEIGHT_DIFF Compatibility
+-------------------------
+
+``DataKind.WEIGHT_DIFF`` is supported only when the client executor sends parameter
+differences and the server aggregation path accepts differences. A client's
+``FLModel.params_type`` is the authoritative description of its result. Recipe construction
+cannot inspect an arbitrary training script, so it validates only recipe-owned server settings,
+such as supported data kinds and a custom aggregator's declared ``expected_data_kind``.
+
+.. list-table:: Recipe and aggregator support
+   :header-rows: 1
+   :widths: 28 30 12 30
+
+   * - Recipe
+     - Server aggregation path
+     - Support
+     - Required configuration
+   * - Unified, PyTorch, TensorFlow, and NumPy ``FedAvgRecipe``; ``FedProxRecipe``
+     - Built-in ``FedAvg`` streaming aggregation
+     - Yes
+     - Set ``aggregator_data_kind=DataKind.WEIGHT_DIFF`` and return
+       ``FLModel(params_type=ParamsType.DIFF)`` from the client.
+   * - ``FedAvgRecipe`` with a custom ``ModelAggregator``
+     - User-provided aggregator
+     - Conditional
+     - The client returns ``ParamsType.DIFF``. The custom aggregator must accept difference
+       models and preserve ``ParamsType.DIFF`` in its aggregate result. If it declares
+       ``expected_data_kind``, it must declare ``DataKind.WEIGHT_DIFF``.
+   * - ``FedAvgRecipeWithHE``
+     - ``HEInTimeAccumulateWeightedAggregator``
+     - Yes
+     - Set ``aggregator_data_kind=DataKind.WEIGHT_DIFF`` and return
+       ``FLModel(params_type=ParamsType.DIFF)`` from the client.
+   * - PyTorch ``FedOptRecipe``
+     - ``InTimeAccumulateWeightedAggregator``
+     - Yes
+     - The recipe fixes its aggregation path to ``WEIGHT_DIFF``. If a custom aggregator
+       declares ``expected_data_kind``, it must declare ``DataKind.WEIGHT_DIFF``.
+   * - TensorFlow ``FedOptRecipe``
+     - Built-in ``FedAvg`` streaming aggregation with FedOpt model update
+     - Yes
+     - Return ``FLModel(params_type=ParamsType.DIFF)`` from the client; there is no separate
+       ``aggregator_data_kind`` parameter.
+   * - ``SwarmLearningRecipe``
+     - ``InTimeAccumulateWeightedAggregator``
+     - Yes
+     - Set ``expected_data_kind=DataKind.WEIGHT_DIFF`` and return
+       ``FLModel(params_type=ParamsType.DIFF)`` from the client.
+   * - ``SklearnFedAvgRecipe``
+     - Built-in ``FedAvg`` streaming aggregation
+     - Conditional
+     - The client script must compute the difference and return
+       ``FLModel(params_type=ParamsType.DIFF)`` explicitly.
+
+The standard ``InTimeAccumulateWeightedAggregator`` and
+``HEInTimeAccumulateWeightedAggregator`` accept both ``WEIGHTS`` and ``WEIGHT_DIFF``
+when their ``expected_data_kind`` is configured accordingly. Aggregators that declare
+``expected_data_kind`` are checked against the recipe setting during construction.
+
+For example, configure PyTorch FedAvg with differences as follows:
+
+.. code-block:: python
+
+    from nvflare.apis.dxo import DataKind
+    from nvflare.app_opt.pt.recipes import FedAvgRecipe
+
+    recipe = FedAvgRecipe(
+        name="fedavg-diff",
+        min_clients=2,
+        num_rounds=5,
+        model=MyModel(),
+        train_script="client.py",
+        aggregator_data_kind=DataKind.WEIGHT_DIFF,
+    )
+
+The client script must compute local minus global parameters and return them explicitly:
+
+.. code-block:: python
+
+    import nvflare.client as flare
+    from nvflare.app_common.abstract.fl_model import ParamsType
+
+    flare.send(flare.FLModel(params=model_diff, params_type=ParamsType.DIFF))
+
+If a custom aggregator declares an incompatible ``expected_data_kind``, recipe construction
+raises an error naming both the configured and declared kinds and how to align them.
+
+
+FedProx
+=======
+
+FedProx is FedAvg with a proximal term added to client optimization to handle data heterogeneity.
+PyTorch provides a concrete ``FedProxRecipe`` with a finite positive ``fedprox_mu`` (default ``0.01``).
+It inherits the aggregation, persistence, transfer, and memory options of PyTorch ``FedAvgRecipe``.
+
+.. warning::
+
+    ``FedProxRecipe`` requires a compatible client. Patched Lightning clients consume ``fedprox_mu``
+    automatically. Raw PyTorch clients must read ``FLModel.meta[FEDPROX_MU]``, snapshot the received global
+    model, and integrate ``PTFedProxLoss``. A client that ignores the metadata performs ordinary local training
+    and is not FedProx-compatible.
+
+PyTorch FedProx
+---------------
+
+.. code-block:: python
+
+    from nvflare.app_opt.pt.recipes import FedProxRecipe
+    from nvflare.recipe import SimEnv
+
+    recipe = FedProxRecipe(
+        name="fedprox-pt",
+        min_clients=2,
+        num_rounds=5,
+        model=MyModel(),
+        train_script="client.py",
+        fedprox_mu=0.01,
+    )
+    env = SimEnv(num_clients=2)
+    run = recipe.execute(env)
+
+For a PyTorch Lightning client patched with ``nvflare.client.lightning.patch``, no loss or training-loop change
+is needed. The patch reads ``fedprox_mu`` from each received model and adds
+``mu * (local_parameter - global_parameter)`` to every dense gradient after accumulation and AMP unscaling but
+before gradient clipping. The loss returned or logged by ``training_step`` excludes this automatically injected
+term, while optimization includes its exact gradient.
+
+While a positive coefficient is active, the patch keeps an additional device-resident snapshot of every
+optimizer-owned trainable parameter for the duration of the round. Account for this extra memory when sizing
+large models.
+
+Custom controllers that use the lower-level ``FedAvg(fedprox_mu=...)`` workflow can schedule the coefficient by
+sending ``FEDPROX_MU`` on every training round after the schedule starts. Positive values activate FedProx and
+may change between rounds; an explicit ``0.0`` disables it
+for that round without allocating the snapshot. Omitting the key after it has been observed raises a contract
+error instead of silently falling back to FedAvg. ``FedProxRecipe`` itself always represents active FedProx and
+therefore accepts only finite positive values.
+
+The automatic path supports Lightning automatic optimization with one optimizer and ``precision="32-true"``
+or ``precision="bf16-mixed"``. It rejects scaler-backed precision, closure-based LBFGS, sparse gradients, and
+mid-round trainability changes. For an unpatched or manual client loop, use ``PTFedProxLoss`` explicitly:
+
+.. code-block:: python
+
+    import copy
+
+    import nvflare.client as flare
+    from nvflare.app_common.utils.fedprox_utils import get_fedprox_mu
+    from nvflare.app_opt.pt import PTFedProxLoss
+
+    while flare.is_running():
+        input_model = flare.receive()
+        if flare.is_evaluate():
+            # Evaluate the received model and send metrics.
+            ...
+        elif flare.is_submit_model():
+            # Send the requested model.
+            ...
+        elif flare.is_train():
+            mu = get_fedprox_mu(input_model)
+            model.load_state_dict(input_model.params)
+            global_model = copy.deepcopy(model)
+            fedprox_loss = PTFedProxLoss(mu=mu)
+
+            for data, target in train_loader:
+                optimizer.zero_grad()
+                output = model(data)
+                ce_loss = criterion(output, target)
+                prox_loss = fedprox_loss(model, global_model)
+                loss = ce_loss + prox_loss
+                loss.backward()
+                optimizer.step()
+        else:
+            raise RuntimeError("Unsupported task")
+
+**Examples:**
+
+- `examples/advanced/cifar10/pt/cifar10-sim/cifar10_fedprox <https://github.com/NVIDIA/NVFlare/tree/main/examples/advanced/cifar10/pt/cifar10-sim/cifar10_fedprox>`_
+
+TensorFlow FedProx
+------------------
+
+TensorFlow does not currently provide a concrete FedProx recipe or an automatic metadata contract. To implement
+FedProx manually with a TensorFlow ``FedAvgRecipe``, configure the coefficient for your own client training script
+and use ``TFFedProxLoss``:
+
+.. code-block:: python
+
+    from nvflare.app_opt.tf.fedprox_loss import TFFedProxLoss
+
+    fedprox_loss = TFFedProxLoss(mu=0.01)
+    # Use in training loop
+
+**Examples:**
+
+- `examples/advanced/cifar10/tf/cifar10_fedprox <https://github.com/NVIDIA/NVFlare/tree/main/examples/advanced/cifar10/tf/cifar10_fedprox>`_
+
+
+FedOpt (Federated Optimization)
+===============================
+
+Federated optimization with server-side optimizer (e.g., SGD, Adam).
+
+PyTorch FedOpt
+--------------
+
+.. code-block:: python
+
+    from nvflare.app_opt.pt.recipes import FedOptRecipe
+    from nvflare.recipe import SimEnv
+
+    recipe = FedOptRecipe(
+        name="fedopt-pt",
+        min_clients=2,
+        num_rounds=5,
+        model=MyModel(),
+        train_script="client.py",
+        optimizer_args={"path": "torch.optim.SGD", "args": {"lr": 1.0, "momentum": 0.6}},
+    )
+    env = SimEnv(num_clients=2)
+    run = recipe.execute(env)
+
+.. note::
+   PyTorch FedOpt supports ``enable_tensor_disk_offload=True`` for streamed PyTorch tensor updates.
+   Import ``ExchangeFormat`` from ``nvflare.client.config`` and configure
+   ``server_expected_format=ExchangeFormat.PYTORCH`` so the server path preserves tensors instead of converting
+   updates to NumPy before aggregation.
+
+**Examples:**
+
+- `examples/advanced/cifar10/pt/cifar10-sim/cifar10_fedopt <https://github.com/NVIDIA/NVFlare/tree/main/examples/advanced/cifar10/pt/cifar10-sim/cifar10_fedopt>`_
+
+TensorFlow FedOpt
+-----------------
+
+.. code-block:: python
+
+    from nvflare.app_opt.tf.recipes import FedOptRecipe
+    from nvflare.recipe import SimEnv
+
+    recipe = FedOptRecipe(
+        name="fedopt-tf",
+        min_clients=2,
+        num_rounds=5,
+        model=MyTFModel(),
+        train_script="client.py",
+        optimizer_args={"path": "tensorflow.keras.optimizers.SGD", "args": {"learning_rate": 1.0}},
+    )
+    env = SimEnv(num_clients=2)
+    run = recipe.execute(env)
+
+**Examples:**
+
+- `examples/advanced/cifar10/tf/cifar10_fedopt <https://github.com/NVIDIA/NVFlare/tree/main/examples/advanced/cifar10/tf/cifar10_fedopt>`_
+
+
+SCAFFOLD
+========
+
+SCAFFOLD algorithm for handling data heterogeneity with control variates.
+
+PyTorch SCAFFOLD
+----------------
+
+.. code-block:: python
+
+    from nvflare.app_opt.pt.recipes import ScaffoldRecipe
+    from nvflare.recipe import SimEnv
+
+    recipe = ScaffoldRecipe(
+        name="scaffold-pt",
+        min_clients=2,
+        num_rounds=5,
+        model=MyModel(),
+        train_script="client.py",
+    )
+    env = SimEnv(num_clients=2)
+    run = recipe.execute(env)
+
+.. note::
+   PyTorch SCAFFOLD supports ``enable_tensor_disk_offload=True`` for streamed PyTorch tensor updates.
+   Import ``ExchangeFormat`` from ``nvflare.client.config`` and configure
+   ``server_expected_format=ExchangeFormat.PYTORCH`` so the server path preserves tensors instead of converting
+   updates to NumPy before aggregation.
+
+PyTorch Lightning clients can use the same patched training script for FedAvg and SCAFFOLD:
+
+.. code-block:: python
+
+    import nvflare.client.lightning as flare
+    from pytorch_lightning import Trainer
+
+    trainer = Trainer(max_epochs=1)
+    flare.patch(trainer)
+
+    while flare.is_running():
+        flare.receive()
+        trainer.fit(model, datamodule=data_module)
+
+``flare.patch`` detects SCAFFOLD global controls, applies ``PTScaffoldHelper`` after each optimizer step,
+and adds the required control difference to the returned ``FLModel``. This automatic path supports Lightning
+automatic optimization with one optimizer whose parameter groups use the same finite, non-negative learning
+rate at each step and have positive total learning-rate exposure per round. Supported precision modes are
+``32-true`` and ``bf16-mixed``. Manual optimization must use an explicit receive/train/send loop without
+``flare.patch`` and integrate ``PTScaffoldHelper`` directly.
+
+.. note::
+
+   Starting with NVFlare 2.9.0, PyTorch SCAFFOLD control differences contain trainable parameters only.
+   Buffers such as BatchNorm running statistics remain ordinary model state, so custom SCAFFOLD aggregators
+   must accept sparse control dictionaries. Trainability may change between rounds; newly trainable local
+   controls are reset to zero. Changing ``requires_grad`` during a training round is not supported.
+
+**Examples:**
+
+- `examples/advanced/cifar10/pt/cifar10-sim/cifar10_scaffold <https://github.com/NVIDIA/NVFlare/tree/main/examples/advanced/cifar10/pt/cifar10-sim/cifar10_scaffold>`_
+- `examples/hello-world/hello-lightning <https://github.com/NVIDIA/NVFlare/tree/main/examples/hello-world/hello-lightning>`_
+
+TensorFlow SCAFFOLD
+-------------------
+
+.. code-block:: python
+
+    from nvflare.app_opt.tf.recipes import ScaffoldRecipe
+    from nvflare.recipe import SimEnv
+
+    recipe = ScaffoldRecipe(
+        name="scaffold-tf",
+        min_clients=2,
+        num_rounds=5,
+        model=MyTFModel(),
+        train_script="client.py",
+    )
+    env = SimEnv(num_clients=2)
+    run = recipe.execute(env)
+
+**Examples:**
+
+- `examples/advanced/cifar10/tf/cifar10_scaffold <https://github.com/NVIDIA/NVFlare/tree/main/examples/advanced/cifar10/tf/cifar10_scaffold>`_
+
+
+Cyclic Learning
+===============
+
+Sequential training across clients in a cyclic order.
+
+PyTorch Cyclic
+--------------
+
+.. code-block:: python
+
+    from nvflare.app_opt.pt.recipes import CyclicRecipe
+    from nvflare.recipe import SimEnv
+
+    recipe = CyclicRecipe(
+        name="cyclic-pt",
+        min_clients=2,
+        num_rounds=5,
+        model=MyModel(),
+        train_script="client.py",
+        task_assignment_timeout=30,
+        shutdown_timeout=120.0,  # External client process only
+    )
+    env = SimEnv(num_clients=2)
+    run = recipe.execute(env)
+
+**Examples:**
+
+- `examples/hello-world/hello-cyclic <https://github.com/NVIDIA/NVFlare/tree/main/examples/hello-world/hello-cyclic>`_
+
+``task_assignment_timeout`` configures the server ``CyclicController`` and
+``shutdown_timeout`` configures the client ``ScriptRunner``. For controller or
+runner options that do not have named recipe parameters, use
+``server_config_overrides`` or ``client_config_overrides``. These dictionaries
+are shallow-merged after the named parameters, so overlapping dictionary values
+take precedence. ``task_check_period`` must be positive when overridden:
+
+.. code-block:: python
+
+    recipe = CyclicRecipe(
+        name="cyclic-advanced",
+        min_clients=2,
+        model=MyModel(),
+        train_script="client.py",
+        task_assignment_timeout=30,
+        server_config_overrides={"task_check_period": 1.0},
+        client_config_overrides={"launch_once": False},
+    )
+
+TensorFlow Cyclic
+-----------------
+
+.. code-block:: python
+
+    from nvflare.app_opt.tf.recipes import CyclicRecipe
+    from nvflare.recipe import SimEnv
+
+    recipe = CyclicRecipe(
+        name="cyclic-tf",
+        min_clients=2,
+        num_rounds=5,
+        model=MyTFModel(),
+        train_script="client.py",
+    )
+    env = SimEnv(num_clients=2)
+    run = recipe.execute(env)
+
+
+XGBoost Recipes
+===============
+
+Federated XGBoost for tree-based models.
+
+XGBoost Horizontal (Histogram-based)
+------------------------------------
+
+Histogram-based federated XGBoost for horizontal data partitioning.
+
+.. code-block:: python
+
+    from nvflare.app_opt.xgboost.recipes import XGBHorizontalRecipe
+    from nvflare.recipe import SimEnv
+
+    recipe = XGBHorizontalRecipe(
+        name="xgb-horizontal",
+        min_clients=2,
+        num_rounds=10,
+        xgb_params={"max_depth": 6, "eta": 0.1, "objective": "binary:logistic"},
+    )
+    env = SimEnv(num_clients=2)
+    run = recipe.execute(env)
+
+**Examples:**
+
+- `examples/advanced/xgboost/fedxgb <https://github.com/NVIDIA/NVFlare/tree/main/examples/advanced/xgboost/fedxgb>`_
+
+XGBoost Bagging (Tree-based)
+----------------------------
+
+Tree-based federated XGBoost using bagging.
+
+.. code-block:: python
+
+    from nvflare.app_opt.xgboost.recipes import XGBBaggingRecipe
+    from nvflare.recipe import SimEnv
+
+    recipe = XGBBaggingRecipe(
+        name="xgb-bagging",
+        min_clients=2,
+        training_mode="bagging",
+        num_rounds=10,
+    )
+    env = SimEnv(num_clients=2)
+    run = recipe.execute(env)
+
+**Examples:**
+
+- `examples/advanced/xgboost/fedxgb (job_tree.py) <https://github.com/NVIDIA/NVFlare/tree/main/examples/advanced/xgboost/fedxgb>`_
+
+XGBoost Vertical
+----------------
+
+Federated XGBoost for vertical data partitioning.
+
+.. code-block:: python
+
+    from nvflare.app_opt.xgboost.recipes import XGBVerticalRecipe
+    from nvflare.recipe import SimEnv
+
+    recipe = XGBVerticalRecipe(
+        name="xgb-vertical",
+        min_clients=2,
+        num_rounds=10,
+    )
+    env = SimEnv(num_clients=2)
+    run = recipe.execute(env)
+
+**Examples:**
+
+- `examples/advanced/xgboost/fedxgb (job_vertical.py) <https://github.com/NVIDIA/NVFlare/tree/main/examples/advanced/xgboost/fedxgb>`_
+- `examples/advanced/xgboost/fedxgb_secure (job_vertical.py) <https://github.com/NVIDIA/NVFlare/tree/main/examples/advanced/xgboost/fedxgb_secure>`_
+
+
+Sklearn Specialized Recipes
+===========================
+
+K-Means FedAvg
+--------------
+
+Federated K-Means clustering.
+
+.. code-block:: python
+
+    from nvflare.app_opt.sklearn.recipes import KMeansFedAvgRecipe
+    from nvflare.recipe import SimEnv
+
+    recipe = KMeansFedAvgRecipe(
+        name="kmeans",
+        min_clients=2,
+        num_rounds=5,
+        n_clusters=3,
+        train_script="client.py",
+    )
+    env = SimEnv(num_clients=2)
+    run = recipe.execute(env)
+
+**Examples:**
+
+- `examples/advanced/sklearn-kmeans <https://github.com/NVIDIA/NVFlare/tree/main/examples/advanced/sklearn-kmeans>`_
+
+SVM FedAvg
+----------
+
+Federated Support Vector Machine.
+
+.. code-block:: python
+
+    from nvflare.app_opt.sklearn.recipes import SVMFedAvgRecipe
+    from nvflare.recipe import SimEnv
+
+    recipe = SVMFedAvgRecipe(
+        name="svm",
+        min_clients=2,
+        num_rounds=5,
+        train_script="client.py",
+    )
+    env = SimEnv(num_clients=2)
+    run = recipe.execute(env)
+
+**Examples:**
+
+- `examples/advanced/sklearn-svm <https://github.com/NVIDIA/NVFlare/tree/main/examples/advanced/sklearn-svm>`_
+
+Logistic Regression FedAvg
+--------------------------
+
+Federated Logistic Regression.
+
+.. code-block:: python
+
+    from nvflare.app_common.np.recipes.lr.fedavg import FedAvgLrRecipe
+    from nvflare.recipe import SimEnv
+
+    recipe = FedAvgLrRecipe(
+        name="lr",
+        min_clients=2,
+        num_rounds=5,
+        train_script="client.py",
+    )
+    env = SimEnv(num_clients=2)
+    run = recipe.execute(env)
+
+**Examples:**
+
+- `examples/hello-world/hello-lr <https://github.com/NVIDIA/NVFlare/tree/main/examples/hello-world/hello-lr>`_
+
+
+Federated Statistics
+====================
+
+Compute federated statistics across distributed data.
+
+.. code-block:: python
+
+    from nvflare.recipe import SimEnv
+    from nvflare.recipe.fedstats import FedStatsRecipe
+
+    recipe = FedStatsRecipe(
+        name="stats",
+        stats_output_path="./output",
+        sites=["site-1", "site-2"],
+        statistic_configs={"count": {}, "mean": {}, "stddev": {}},
+        stats_generator=my_stats_generator,
+    )
+    env = SimEnv(clients=["site-1", "site-2"])
+    run = recipe.execute(env)
+
+**Examples:**
+
+- `examples/hello-world/hello-tabular-stats <https://github.com/NVIDIA/NVFlare/tree/main/examples/hello-world/hello-tabular-stats>`_
+- `examples/advanced/federated-statistics/df_stats <https://github.com/NVIDIA/NVFlare/tree/main/examples/advanced/federated-statistics/df_stats>`_
+- `examples/advanced/federated-statistics/image_stats <https://github.com/NVIDIA/NVFlare/tree/main/examples/advanced/federated-statistics/image_stats>`_
+
+Kaplan-Meier Survival Analysis
+------------------------------
+
+Federated Kaplan-Meier survival analysis with optional homomorphic encryption over binned event histograms.
+The ``KMRecipe`` is defined in the Kaplan-Meier example's ``job.py`` rather than exported as a package-level
+recipe.
+
+Run the snippet from the Kaplan-Meier example directory so ``from job import KMRecipe`` resolves correctly:
+
+.. code-block:: bash
+
+    cd examples/advanced/kaplan-meier-he
+
+.. code-block:: python
+
+    from job import KMRecipe
+    from nvflare.recipe import SimEnv
+
+    # KMRecipe is defined in examples/advanced/kaplan-meier-he/job.py
+    recipe = KMRecipe(
+        num_clients=5,
+        encryption=True,
+        data_root="/tmp/nvflare/dataset/km_data",
+        he_context_path_client="/tmp/nvflare/he_context/he_context_client.txt",
+        he_context_path_server="/tmp/nvflare/he_context/he_context_server.txt",
+    )
+    env = SimEnv(num_clients=5)
+    run = recipe.execute(env)
+
+**Examples:**
+
+- `examples/advanced/kaplan-meier-he <https://github.com/NVIDIA/NVFlare/tree/main/examples/advanced/kaplan-meier-he>`_
+
+
+Federated Evaluation
+====================
+
+Evaluate a pre-trained model across multiple sites.
+
+PyTorch FedEval
+---------------
+
+Evaluate a pre-trained PyTorch model by sending it to all clients for evaluation on their local data.
+
+.. code-block:: python
+
+    from nvflare.app_opt.pt.recipes.fedeval import FedEvalRecipe
+    from nvflare.recipe import SimEnv
+
+    recipe = FedEvalRecipe(
+        name="eval_job",
+        model=MyModel(),
+        eval_ckpt="/path/to/pretrained_model.pt",
+        min_clients=2,
+        eval_script="client.py",
+        eval_args="--batch_size 32",
+    )
+    env = SimEnv(num_clients=2)
+    run = recipe.execute(env)
+
+.. note::
+   ``eval_ckpt`` is **required**. It can be either:
+
+   * an absolute path on the server to the pre-trained checkpoint (.pt, .pth), or
+   * a relative or absolute path to a local checkpoint file that will be bundled with the job
+     (for example, via utilities such as ``prepare_initial_ckpt``).
+
+   When specifying an absolute server-side path, the checkpoint file may not exist locally when
+   building the job.
+
+**Examples:**
+
+- `examples/hello-world/hello-lightning-eval <https://github.com/NVIDIA/NVFlare/tree/main/examples/hello-world/hello-lightning-eval>`_
+
+
+Cross-Site Evaluation
+=====================
+
+Evaluate models across all client sites (compare each client's model against all datasets).
+
+.. code-block:: python
+
+    from nvflare.app_common.np.recipes import NumpyCrossSiteEvalRecipe
+    from nvflare.recipe import SimEnv
+
+    recipe = NumpyCrossSiteEvalRecipe(
+        name="cross-eval",
+        min_clients=2,
+        eval_script="evaluate.py",
+        eval_args="--data_root /path/to/data",
+        initial_ckpt="/path/to/pretrained_model.npy",  # Optional: evaluate specific model
+    )
+    env = SimEnv(num_clients=2)
+    run = recipe.execute(env)
+
+.. note::
+   - Use ``eval_script`` to specify custom evaluation logic. If not provided, uses a built-in
+     dummy validator (for testing only).
+   - Use ``initial_ckpt`` to evaluate a specific pre-trained model. If not provided, the recipe
+     evaluates models from the training run directory.
+
+**Examples:**
+
+- `examples/hello-world/hello-numpy-cross-val <https://github.com/NVIDIA/NVFlare/tree/main/examples/hello-world/hello-numpy-cross-val>`_
+
+
+Private Set Intersection (PSI)
+==============================
+
+Compute intersection of private sets across clients.
+
+.. code-block:: python
+
+    from nvflare.app_common.psi.recipes import DhPSIRecipe
+    from nvflare.recipe import SimEnv
+
+    recipe = DhPSIRecipe(
+        name="psi",
+        min_clients=2,
+    )
+    env = SimEnv(num_clients=2)
+    run = recipe.execute(env)
+
+**Examples:**
+
+- `examples/advanced/psi/user_email_match <https://github.com/NVIDIA/NVFlare/tree/main/examples/advanced/psi/user_email_match>`_
+
+
+Flower Integration
+==================
+
+Run Flower-based federated learning jobs.
+
+.. code-block:: python
+
+    from nvflare.app_opt.flower.recipe import FlowerRecipe
+    from nvflare.recipe import SimEnv
+
+    recipe = FlowerRecipe(
+        name="flower-job",
+        min_clients=2,
+        flower_content="path/to/flower/app",
+        run_config={"num-server-rounds": 5}, # Optional: used to override default values in pyproject.toml
+    )
+    env = SimEnv(num_clients=2)
+    run = recipe.execute(env)
+
+**Examples:**
+
+- `examples/hello-world/hello-flower <https://github.com/NVIDIA/NVFlare/tree/main/examples/hello-world/hello-flower>`_
+
+Server-Predeployed Flower App Mode
+----------------------------------
+
+For production deployments where BYOC (Bring Your Own Code) is restricted, you can use 
+server-predeployed Flower apps. In this mode, the Flower application code is **admin-controlled 
+and pre-installed on the server** at a known path, and NVFlare distributes it to clients via 
+Flower's FAB (Flower Application Bundle) mechanism. This eliminates the need for BYOC authorization.
+
+**Important**: ``flower_app_path`` must reference apps that are **pre-approved and managed by 
+server administrators**, not user-provided paths. The path must be within the workspace's 
+``local/custom/`` directory to ensure the app is pre-deployed and controlled by the server 
+admin, not arbitrarily chosen by users at job submission time.
+
+.. code-block:: python
+
+    from nvflare.app_opt.flower.recipe import FlowerRecipe
+    from nvflare.recipe import ProdEnv
+
+    recipe = FlowerRecipe(
+        name="flower-job",
+        min_clients=2,
+        flower_app_path="local/custom/preapproved_apps/my_app",  # Admin-predeployed on server
+        run_config={"num-server-rounds": 5},
+    )
+    env = ProdEnv(startup_kit_location="/path/to/startup_kit")
+    run = recipe.execute(env)
+
+**Key Differences:**
+
+- ``flower_content``: Packages Flower app in job ZIP (requires BYOC authorization)
+- ``flower_app_path``: References **admin-predeployed** app on server (no BYOC needed)
+
+**Security Model**: When using ``flower_app_path`` with ``BYOC disabled`` and 
+``flower_predeployed=true``:
+
+- **No user-provided NVFlare custom code** is deployed through the job
+- Flower app code is distributed only from **server-admin-controlled/pre-approved app locations**
+- ``flower_app_path`` must start with ``local/custom/`` to enforce admin control
+- Arbitrary user-chosen paths are **not allowed**; only pre-approved apps in designated directories
+
+**Authorization Requirements:**
+
+Sites using ``flower_app_path`` must have the ``server-predeployed-flwr`` permission 
+granted in their ``authorization.json``. By default, this permission is set to ``"none"`` 
+(denied) for all roles. To enable:
+
+.. code-block:: json
+
+    {
+      "format_version": "1.0",
+      "permissions": {
+        "lead": {
+          "server-predeployed-flwr": "any"
+        }
+      }
+    }
+
+See :ref:`site_policy_management` for details on site authorization policies.
+
+
+Swarm Learning
+==============
+
+Decentralized federated learning without a central server.
+
+.. code-block:: python
+
+    from nvflare.app_opt.pt.recipes.swarm import SwarmLearningRecipe
+    from nvflare.client.config import ExchangeFormat
+    from nvflare.recipe import SimEnv
+
+    recipe = SwarmLearningRecipe(
+        name="swarm",
+        model=MyModel(),
+        min_clients=3,
+        num_rounds=5,
+        train_script="client.py",
+        key_metric="accuracy",
+        key_metric_mode="max",
+        initial_ckpt="path/to/pretrained.pt",  # Optional: pre-trained weights
+        progress_timeout=7200,
+        learn_task_timeout=None,  # No training-task time limit
+        learn_task_ack_timeout=3600,
+        final_result_ack_timeout=3600,
+        max_concurrent_submissions=1,
+        aggregation_format=ExchangeFormat.PYTORCH,
+        enable_tensor_disk_offload=True,
+    )
+    env = SimEnv(num_clients=3)
+    run = recipe.execute(env)
+
+For ``initial_ckpt``, a relative path is bundled and distributed to every client.
+An absolute path is not distributed; it must be readable at the same path on every
+client because the Swarm model persistor runs client-side.
+
+The recipe configures client-side best-model selection by default. Training clients
+must report a pre-training validation metric matching ``key_metric``; for dictionary
+metrics, the named entry is selected. Set ``key_metric_mode="min"`` for metrics such
+as loss, or set ``key_metric=None`` to disable best-model selection. In ``"min"``
+mode, Swarm logs and best-metric records expose the negated comparison value. Model
+selection starts after round 0, so a one-round job does not create a best-model
+checkpoint. The best model is distributed at successful workflow completion and the
+default PyTorch persistor writes ``best_FL_global_model.pt`` at each result client.
+Rotating aggregation clients can write interim per-client best checkpoints during
+the run; those files are authoritative only after successful completion at result
+clients.
+
+.. note::
+   For large models (>2 GB), tune the following parameters:
+
+   - ``learn_task_timeout`` (default ``None``): maximum training-task duration.
+   - ``learn_task_ack_timeout`` and ``final_result_ack_timeout``: P2P model-transfer
+     acknowledgment budgets. The ``round_timeout`` compatibility shortcut sets both
+     when their explicit parameters are omitted.
+   - ``progress_timeout`` (default 3600 s): maximum time without workflow progress.
+   - ``max_concurrent_submissions`` (default 1, minimum 1): concurrent aggregation submissions.
+   - For PyTorch tensor streaming with lower aggregation-client memory pressure, set
+     ``aggregation_format=ExchangeFormat.PYTORCH`` and
+     ``enable_tensor_disk_offload=True``. Configure ``tensor_download_chunk_size``
+     and streaming timeouts through ``recipe.add_client_config({...})``. This
+     offloads the receiving aggregation path, not the trainer's in-memory model
+     or outgoing result tensors.
+   - Client API transport is selected by the site's Cell driver configuration rather than
+     by the recipe. A site can use the F3 ``FileDriver`` (scheme ``shared-file``) for an
+     attached trainer when shared-filesystem transport is required; a launched
+     external-process trainer instead requires a clear TCP listener bound to loopback.
+   - Download-layer settings such as ``tensor_min_download_timeout`` can be set
+     via ``recipe.add_client_config({...})``. See
+     :ref:`timeout_troubleshooting`.
+
+For advanced controller settings, ``server_config_overrides`` and
+``client_config_overrides`` are shallow-merged into ``SwarmServerConfig`` and
+``SwarmClientConfig`` after the named parameters. Overlapping dictionary values for
+non-recipe-managed fields therefore take precedence over the documented named API.
+Client overrides cannot replace the recipe-managed executor, aggregator, persistor,
+shareable generator, model selector, or ``min_responses_required``. Use
+``key_metric=None`` to disable selection; for a custom selector or other custom
+components, use ``BaseSwarmLearningRecipe`` with an explicit ``SwarmClientConfig``.
+Server overrides cannot replace ``min_clients``; set it through the named parameter
+so all scheduler and workflow quorum settings remain aligned.
+
+
+Edge Recipes
+============
+
+Recipes for edge device federated learning.
+
+EdgeFedBuffRecipe
+-----------------
+
+.. code-block:: python
+
+    from nvflare.edge.tools.edge_fed_buff_recipe import (
+        EdgeFedBuffRecipe,
+        ModelManagerConfig,
+        DeviceManagerConfig,
+    )
+
+    recipe = EdgeFedBuffRecipe(
+        job_name="edge-fedavg",
+        model=MyModel(),
+        model_manager_config=ModelManagerConfig(max_num_active_model_versions=3, max_model_version=20),
+        device_manager_config=DeviceManagerConfig(device_selection_size=100),
+        initial_ckpt="/path/to/pretrained.pt",  # Optional: pre-trained weights
+    )
+
+**Examples:**
+
+- `examples/advanced/edge/jobs <https://github.com/NVIDIA/NVFlare/tree/main/examples/advanced/edge/jobs>`_
+
+
+Utility Functions
+=================
+
+Add Experiment Tracking
+-----------------------
+
+Add experiment tracking (MLflow, TensorBoard, W&B) to any recipe.
+
+.. code-block:: python
+
+    from nvflare.recipe.utils import add_experiment_tracking
+
+    add_experiment_tracking(recipe, tracking_type="tensorboard")
+    # or
+    add_experiment_tracking(recipe, tracking_type="mlflow")
+    # or
+    add_experiment_tracking(recipe, tracking_type="wandb")
+
+Add Cross-Site Evaluation
+-------------------------
+
+Add cross-site evaluation to any training recipe.
+
+.. code-block:: python
+
+    from nvflare.recipe.utils import add_cross_site_evaluation
+
+    add_cross_site_evaluation(recipe)
+    # or limit evaluation to selected clients
+    add_cross_site_evaluation(recipe, participating_clients=["site-1", "site-3"])
